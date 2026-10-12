@@ -1,0 +1,1166 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
+import {
+  ArrowDownToLine,
+  ArrowLeftRight,
+  ArrowRight,
+  Box,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  CircleHelp,
+  Crosshair,
+  Download,
+  FileText,
+  GitBranch,
+  GitCommitHorizontal,
+  Layers,
+  Link2,
+  Loader2,
+  LogOut,
+  Maximize2,
+  Minus,
+  Network,
+  Plus,
+  RefreshCw,
+  Search,
+  ShieldCheck,
+  Timer,
+  TriangleAlert,
+  X,
+  Zap,
+} from "lucide-react";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { ProcessDiagram, SourceDiagram, IntersectionCrop } from "@/components/untangle/diagrams";
+import { FileUploadDropzone } from "@/components/untangle/file-upload";
+import { AuthModal, type AuthUser } from "@/components/auth-modal";
+import {
+  auditTags as demoAuditTags,
+  clarifications as demoClarifications,
+  defaultGraphEdges,
+  defaultGraphNodes,
+  mapProcessResponse,
+  metrics as demoMetrics,
+  resolutionToOption,
+  resolveQueue,
+  type AuditStatus,
+  type AuditTag,
+  type ClarificationView,
+  type EquipmentId,
+  type GraphEdgeView,
+  type GraphNodeView,
+  type Resolution,
+  type WorkspaceMetrics,
+} from "@/lib/untangle-data";
+import { processPid, resolveAmbiguity, UntangleApiError } from "@/lib/untangle-api";
+import { exportDiagram } from "@/lib/diagram-export";
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "UNTANGLE — P&ID Digitisation Workspace" },
+      {
+        name: "description",
+        content:
+          "Project UNTANGLE engineering workspace for traceable P&ID digitisation, process simplification, and tag completeness auditing.",
+      },
+      { property: "og:title", content: "UNTANGLE — P&ID Digitisation Workspace" },
+      {
+        property: "og:description",
+        content:
+          "Explore linked engineering diagrams, validate process topology, and resolve ambiguous connections.",
+      },
+      { property: "og:type", content: "website" },
+      { name: "twitter:card", content: "summary_large_image" },
+    ],
+  }),
+  component: Index,
+});
+
+const statusLabels: Record<AuditStatus, string> = {
+  matched: "Matched",
+  missing: "Missing in P&ID",
+  pending: "Pending review",
+};
+
+const AUTH_STORAGE_KEY = "untangle.auth.session";
+
+function initialsForName(name: string): string {
+  return name
+    .trim()
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part.charAt(0).toUpperCase())
+    .join("");
+}
+
+function Index() {
+  const [selected, setSelected] = useState<EquipmentId | null>(null);
+  const [hovered, setHovered] = useState<EquipmentId | null>(null);
+  const [boxes, setBoxes] = useState(true);
+  const [zoom, setZoom] = useState(100);
+  const [view, setView] = useState("pfd");
+  const [auditOpen, setAuditOpen] = useState(true);
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [workspaceMetrics, setWorkspaceMetrics] = useState<WorkspaceMetrics>(demoMetrics);
+  const [auditRows, setAuditRows] = useState<AuditTag[]>(demoAuditTags);
+  const [graphNodes, setGraphNodes] = useState<GraphNodeView[]>(defaultGraphNodes);
+  const [graphEdges, setGraphEdges] = useState<GraphEdgeView[]>(defaultGraphEdges);
+  const [queue, setQueue] = useState<ClarificationView[]>(demoClarifications);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [queueIndex, setQueueIndex] = useState(0);
+  const [resolution, setResolution] = useState<Resolution>("bridge");
+  const [selectedOption, setSelectedOption] = useState<string>("");
+  const [resolvedTags, setResolvedTags] = useState<string[]>([]);
+  const [located, setLocated] = useState(false);
+  const [locating, setLocating] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [expanded, setExpanded] = useState<"source" | "pfd" | null>(null);
+  const [exporting, setExporting] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [resolving, setResolving] = useState(false);
+  const [projectName, setProjectName] = useState("Project_Alpha_4K_Sheet_01.pdf");
+  const [excelName, setExcelName] = useState("Project_Alpha_IO_List.xlsx");
+  const [pdfPageCount, setPdfPageCount] = useState(1);
+  const [liveConnected, setLiveConnected] = useState(false);
+  const [sourcePdf, setSourcePdf] = useState<File | null>(null);
+  const [sourcePdfUrl, setSourcePdfUrl] = useState<string | null>(null);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+
+  useEffect(() => {
+    try {
+      const savedSession = localStorage.getItem(AUTH_STORAGE_KEY);
+      if (savedSession) {
+        const parsed: unknown = JSON.parse(savedSession);
+        if (
+          typeof parsed === "object" &&
+          parsed !== null &&
+          "fullName" in parsed &&
+          "email" in parsed &&
+          "role" in parsed &&
+          typeof parsed.fullName === "string" &&
+          typeof parsed.email === "string" &&
+          typeof parsed.role === "string"
+        ) {
+          setAuthUser({
+            fullName: parsed.fullName,
+            email: parsed.email,
+            role: parsed.role,
+          });
+        } else {
+          localStorage.removeItem(AUTH_STORAGE_KEY);
+        }
+      }
+    } catch (error) {
+      console.error("Unable to restore the local UNTANGLE session.", error);
+    } finally {
+      setAuthReady(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!sourcePdf) {
+      setSourcePdfUrl(null);
+      return;
+    }
+
+    const url = URL.createObjectURL(sourcePdf);
+    setSourcePdfUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [sourcePdf]);
+
+  const active = hovered ?? selected;
+  const current = queue[queueIndex];
+  const activeOption = selectedOption || (current ? resolutionToOption(current, resolution) : "");
+
+  const tags = useMemo(
+    () =>
+      auditRows.map((tag) => ({
+        ...tag,
+        status:
+          resolvedTags.includes(tag.tag) || (tag.tag === "LT-309" && located)
+            ? ("matched" as const)
+            : tag.status,
+        bounds: tag.tag === "LT-309" && located ? "[504, 126, 565, 277]" : tag.bounds,
+      })),
+    [auditRows, located, resolvedTags],
+  );
+
+  const matchedCount = tags.filter((t) => t.status === "matched").length;
+  const missingCount = tags.filter((t) => t.status === "missing").length;
+  const pendingCount = tags.filter((t) => t.status === "pending").length;
+  const completeness =
+    workspaceMetrics.total > 0
+      ? ((workspaceMetrics.matched / workspaceMetrics.total) * 100).toFixed(1)
+      : "0.0";
+
+  const filtered = tags.filter(
+    (t) =>
+      (filter === "all" || t.status === filter) &&
+      `${t.tag} ${t.type}`.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  const notify = (text: string) => {
+    setNotice(text);
+  };
+
+  const handleLogout = () => {
+    try {
+      localStorage.removeItem(AUTH_STORAGE_KEY);
+    } catch (error) {
+      console.error("Unable to clear the local UNTANGLE session.", error);
+      toast.error("Could not clear saved session", {
+        description:
+          "Your workspace has been locked for this session, but browser storage could not be updated.",
+      });
+    }
+    setAuthUser(null);
+    toast.success("Signed out");
+  };
+
+  const showApiError = (error: unknown) => {
+    if (error instanceof UntangleApiError) {
+      toast.error(error.unreachable ? "Server unreachable" : "Request failed", {
+        description: error.message,
+      });
+      notify(error.message);
+      return;
+    }
+    const message =
+      error instanceof Error ? error.message : "Unexpected error talking to the backend.";
+    toast.error("Request failed", { description: message });
+    notify(message);
+  };
+
+  const handleProcess = async (pdf: File, excel: File) => {
+    setProcessing(true);
+    try {
+      const response = await processPid(pdf, excel);
+      const mapped = mapProcessResponse(response);
+      setSourcePdf(pdf);
+      setWorkspaceMetrics(mapped.metrics);
+      setAuditRows(mapped.auditTags);
+      setGraphNodes(mapped.graphNodes);
+      setGraphEdges(mapped.graphEdges);
+      setQueue(mapped.clarifications);
+      setPdfPageCount(mapped.pdfPageCount);
+      setProjectName(pdf.name);
+      setExcelName(excel.name);
+      setResolvedTags([]);
+      setLocated(false);
+      setLiveConnected(true);
+      setQueueIndex(0);
+      setResolution("bridge");
+      setSelectedOption(
+        mapped.clarifications[0] ? resolutionToOption(mapped.clarifications[0], "bridge") : "",
+      );
+      toast.success("P&ID processed", {
+        description: `${mapped.metrics.matched}/${mapped.metrics.total} tags matched in ${mapped.metrics.seconds}s`,
+      });
+      notify(
+        `Processed ${pdf.name} in ${mapped.metrics.seconds}s. Graph integrity: ${mapped.metrics.graphIntegrityLabel}.`,
+      );
+      if (mapped.clarifications.length) setQueueOpen(true);
+    } catch (error) {
+      showApiError(error);
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const selectSource = (id: EquipmentId) => {
+    setSelected(id);
+    if (locating) {
+      setLocated(true);
+      setLocating(false);
+      notify("LT-309 located on source drawing. Manual match recorded for this session.");
+    }
+  };
+
+  const openQueue = () => {
+    setQueueIndex(0);
+    setResolution("bridge");
+    if (queue[0]) setSelectedOption(resolutionToOption(queue[0], "bridge"));
+    setQueueOpen(true);
+  };
+
+  const applyResolution = async () => {
+    if (!current) return;
+    const option = activeOption || resolutionToOption(current, resolution);
+    setResolving(true);
+    try {
+      if (liveConnected) {
+        const result = await resolveAmbiguity(current.id, option);
+        setGraphEdges((prev) =>
+          result.edges.map((edge) => ({
+            id: edge.id,
+            source: edge.source,
+            target: edge.target,
+            confidence: edge.confidence,
+          })),
+        );
+        setWorkspaceMetrics((prev) => ({
+          ...prev,
+          matched: result.kpis.matched_tags,
+          total: result.kpis.total_tags,
+          retained: result.kpis.retained_equipment,
+          equipmentTotal: result.kpis.retained_equipment,
+          seconds: Number(result.kpis.processing_time_seconds.toFixed(2)),
+          graphIntegrityLabel: result.kpis.graph_integrity,
+          integrity: Number(result.kpis.graph_integrity.match(/(\d+)\s*%/)?.[1] ?? prev.integrity),
+          changedEdges: Number(result.kpis.graph_integrity.match(/(\d+)\s+changed/i)?.[1] ?? 0),
+        }));
+        toast.success("Graph re-validated", { description: result.message });
+        notify(result.message);
+      } else {
+        notify(
+          resolution === "unresolved"
+            ? "Intersection kept flagged for review."
+            : `Intersection #${String(current.id).padStart(2, "0")} resolved. Graph re-validated: 100% integrity.`,
+        );
+      }
+
+      const next = resolveQueue(queue, current.id, option);
+      if (!/unresolved|flagged|not sure/i.test(option)) {
+        setResolvedTags((prev) => [...prev, current.tag]);
+      }
+      setQueue(next);
+      setQueueIndex(0);
+      setResolution("bridge");
+      setSelectedOption(next[0] ? resolutionToOption(next[0], "bridge") : "");
+      if (!next.length) setQueueOpen(false);
+    } catch (error) {
+      showApiError(error);
+    } finally {
+      setResolving(false);
+    }
+  };
+
+  const handleExport = async (format: "SVG" | "PNG" | "PDF") => {
+    setExporting(true);
+    try {
+      await exportDiagram(format);
+      notify(`${format} diagram exported.`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Export failed. Please try again.");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const auditTable = (compact = false) => (
+    <div className={`table-scroll ${compact ? "compact-audit" : ""}`}>
+      <table>
+        <thead>
+          <tr>
+            <th>TAG NAME</th>
+            <th>TYPE</th>
+            <th>SOURCE BOUNDING BOX</th>
+            <th>EXCEL ROW MATCH</th>
+            <th>STATUS</th>
+            <th className="action-heading">ACTION</th>
+          </tr>
+        </thead>
+        <tbody>
+          {filtered.map((tag) => (
+            <tr key={tag.tag} className={selected === tag.equipment ? "selected-row" : ""}>
+              <td>
+                <span className="tag-cell">
+                  <span className={`status-dot ${tag.status}`} />
+                  {tag.tag}
+                </span>
+              </td>
+              <td>{tag.type}</td>
+              <td className={`mono bounds ${tag.status === "missing" ? "muted-text" : ""}`}>
+                {tag.bounds}
+              </td>
+              <td>
+                <span className="row-match">
+                  <FileText size={12} />
+                  Row #{tag.row}
+                </span>
+              </td>
+              <td>
+                <span className={`status-badge ${tag.status}`}>
+                  {tag.status === "matched" ? (
+                    <Check size={11} />
+                  ) : tag.status === "missing" ? (
+                    <X size={11} />
+                  ) : (
+                    <TriangleAlert size={11} />
+                  )}{" "}
+                  {statusLabels[tag.status]}
+                </span>
+              </td>
+              <td>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className={`table-action ${tag.status}`}
+                  onClick={() => {
+                    if (tag.status === "pending") openQueue();
+                    else {
+                      setSelected(tag.equipment);
+                      setBoxes(true);
+                      if (tag.status === "missing") {
+                        setLocating(true);
+                        notify(`Select a region on the source drawing to locate ${tag.tag}.`);
+                      }
+                    }
+                  }}
+                >
+                  {tag.status === "matched"
+                    ? "View source"
+                    : tag.status === "missing"
+                      ? "Locate manually"
+                      : "Resolve"}
+                  <ArrowRight size={13} />
+                </Button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {!filtered.length && (
+        <div className="empty-state">
+          <Search size={22} />
+          <p>No matching tags</p>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="untangle-app">
+      {processing && (
+        <div className="processing-overlay" role="status" aria-live="polite">
+          <div className="processing-card">
+            <Loader2 className="spin" size={28} />
+            <h2>Processing P&ID</h2>
+            <p>Extracting tags, building the process graph, and running integrity checks…</p>
+          </div>
+        </div>
+      )}
+
+      <header className="topbar">
+        <div className="brand">
+          <div className="brand-mark">
+            <Network size={25} />
+          </div>
+          <div>
+            <div className="brand-name">
+              UNTANGLE<span className="brand-point">.</span>
+            </div>
+            <div className="brand-subtitle">P&ID DIGITISATION PLATFORM</div>
+          </div>
+        </div>
+        <div className="product-badge">
+          Emerson P&ID Digitizer <span>v1.0</span>
+        </div>
+        <div className="topbar-right">
+          <span className="system-pill">
+            <span className={`status-dot ${liveConnected ? "matched" : "pending"}`} />
+            {liveConnected ? "Backend connected" : "Demo data · upload to connect"}
+          </span>
+          <span className="header-divider" />
+          <div className="emerson-wordmark">
+            EMERSON<span>Automation Solutions</span>
+          </div>
+          {authUser ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <button type="button" className="profile-trigger" aria-label="Open profile menu">
+                  <span className="avatar">{initialsForName(authUser.fullName)}</span>
+                  <span className="profile-trigger-copy">
+                    <strong>{authUser.fullName}</strong>
+                    <small>{authUser.role}</small>
+                  </span>
+                  <ChevronDown size={13} />
+                </button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent className="profile-menu" align="end">
+                <DropdownMenuLabel className="profile-menu-heading">
+                  <strong>{authUser.fullName}</strong>
+                  <small>{authUser.email}</small>
+                  <span>{authUser.role}</span>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                <DropdownMenuItem className="profile-logout" onSelect={handleLogout}>
+                  <LogOut size={14} />
+                  Log out
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <Button size="sm" variant="outline" onClick={() => setAuthReady(true)}>
+              Sign in
+            </Button>
+          )}
+        </div>
+      </header>
+
+      <main className="workspace">
+        <div className="breadcrumb">
+          <span>Workspace</span>
+          <ChevronRight size={12} />
+          <span>Project Alpha</span>
+          <ChevronRight size={12} />
+          <span className="breadcrumb-active">Sheet 01</span>
+          <span className="session-label">
+            {liveConnected ? "LIVE WORKSPACE" : "DEMO WORKSPACE"}
+          </span>
+        </div>
+
+        <FileUploadDropzone
+          processing={processing}
+          onProcess={handleProcess}
+          onPdfSelected={setSourcePdf}
+          locked={!authUser}
+          onRequestLogin={() => setAuthReady(true)}
+          pdfName={projectName}
+          excelName={excelName}
+        />
+
+        <section className="project-heading">
+          <div className="project-info">
+            <div className="project-icon">
+              <FileText size={22} />
+            </div>
+            <div className="min-w-0">
+              <div className="heading-eyebrow">PROJECT UNTANGLE</div>
+              <h1>{projectName}</h1>
+              <div className="project-meta">
+                <span>Engineering drawing</span>
+                <span className="meta-dot">·</span>
+                <span>
+                  {pdfPageCount} page{pdfPageCount === 1 ? "" : "s"}
+                </span>
+                <span className="meta-dot">·</span>
+                <span className="processed">
+                  <CheckCircle2 size={12} />
+                  Processed in {workspaceMetrics.seconds}s
+                </span>
+              </div>
+            </div>
+          </div>
+          <div className="project-actions">
+            <Button variant="outline" className="queue-button" onClick={openQueue}>
+              <TriangleAlert size={15} />
+              Clarification queue
+              <span className="queue-count">
+                {queue.length}
+                <span className="pending-word"> pending</span>
+              </span>
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button disabled={exporting} className="export-button">
+                  <Download size={15} />
+                  {exporting ? "Exporting…" : "Export diagram"}
+                  <ChevronDown size={14} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                {(["SVG", "PNG", "PDF"] as const).map((format) => (
+                  <DropdownMenuItem
+                    key={format}
+                    onSelect={() => handleExport(format)}
+                    disabled={view === "audit"}
+                  >
+                    <ArrowDownToLine size={14} />
+                    Export as {format}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
+        </section>
+
+        <section className="metric-grid" aria-label="Project metrics">
+          <div className="metric-card">
+            <div className="metric-label">
+              <span>Total I/O tags parsed</span>
+              <Crosshair size={16} />
+            </div>
+            <div className="metric-value">
+              {workspaceMetrics.matched}
+              <span className="metric-denominator">/ {workspaceMetrics.total}</span>
+              <span className="metric-qualifier success-text">Matched</span>
+            </div>
+            <div className="metric-progress">
+              <span style={{ width: `${Math.min(100, Number(completeness))}%` }} />
+            </div>
+            <div className="metric-foot">
+              <span>
+                <span className="status-dot matched" />
+                {completeness}% completeness
+              </span>
+              <span className="warning-text">{missingCount + pendingCount} require attention</span>
+            </div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">
+              <span>Major equipment retained</span>
+              <Box size={16} />
+            </div>
+            <div className="metric-value">
+              {workspaceMetrics.retained}
+              <span className="metric-denominator">/ {workspaceMetrics.equipmentTotal}</span>
+              <span className="metric-qualifier">Retained</span>
+              <span className="metric-check">
+                <CheckCircle2 size={17} />
+              </span>
+            </div>
+            <div className="equipment-breakdown">
+              <span>
+                <b>{graphNodes.filter((n) => n.kind === "tank").length}</b> Tanks
+              </span>
+              <span>
+                <b>{graphNodes.filter((n) => n.kind === "pump").length}</b> Pumps
+              </span>
+              <span>
+                <b>{graphNodes.filter((n) => n.kind === "mixer").length}</b> Mixers
+              </span>
+              <span>
+                <b>{graphNodes.filter((n) => n.kind === "exchanger").length}</b> Heat exchangers
+              </span>
+            </div>
+            <div className="metric-foot">
+              <span>All critical equipment preserved</span>
+            </div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">
+              <span>Graph topology integrity</span>
+              <ShieldCheck size={16} />
+            </div>
+            <div className="metric-value">
+              {workspaceMetrics.integrity}
+              <span className="metric-denominator percent">%</span>
+              <span className="metric-qualifier success-text">Validated</span>
+            </div>
+            <div className="integrity-line">
+              <GitCommitHorizontal size={15} />
+              <b>{workspaceMetrics.changedEdges}</b> changed edges during layout
+            </div>
+            <div className="metric-foot">
+              <span>
+                <span className="status-dot matched" />
+                {workspaceMetrics.graphIntegrityLabel}
+              </span>
+            </div>
+          </div>
+          <div className="metric-card">
+            <div className="metric-label">
+              <span>Processing time</span>
+              <Timer size={16} />
+            </div>
+            <div className="metric-value">
+              {workspaceMetrics.seconds}
+              <span className="metric-qualifier">Seconds</span>
+              <span className="speed-badge">
+                <Zap size={11} />
+                Fast
+              </span>
+            </div>
+            <div className="pipeline-label">
+              Spatial Tiling <ChevronRight size={10} />
+              YOLOv11
+              <ChevronRight size={10} />
+              PaddleOCR
+            </div>
+            <div className="metric-foot">
+              <span>
+                <Zap size={11} />
+                TensorRT accelerated
+              </span>
+              <span className="success-text">&lt;3s / sheet</span>
+            </div>
+          </div>
+        </section>
+
+        <div className="workspace-section-heading">
+          <div>
+            <Layers size={16} />
+            <h2>Diagram workspace</h2>
+            <span className="section-separator" />
+            <span className="workspace-description">Source to simplified process</span>
+          </div>
+          <span className="trace-status">
+            <Link2 size={13} />
+            Bi-directional traceability active
+            <span className="status-dot matched" />
+          </span>
+        </div>
+
+        <section className={`diagram-workspace ${expanded ? `expanded-${expanded}` : ""}`}>
+          <div className={`viewer source-viewer ${expanded === "source" ? "expanded-viewer" : ""}`}>
+            <div className="viewer-heading">
+              <div>
+                <FileText size={15} />
+                <h3>Source drawing viewer</h3>
+              </div>
+              <span className="viewer-label">ORIGINAL P&ID</span>
+            </div>
+            <div className="viewer-toolbar">
+              <span className="page-label">
+                Page <b>1</b> of {pdfPageCount}
+                <ChevronDown size={12} />
+              </span>
+              <div className="zoom-controls">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Zoom out"
+                  title="Zoom out"
+                  onClick={() => setZoom((v) => Math.max(50, v - 25))}
+                >
+                  <Minus />
+                </Button>
+                <span className="mono">{zoom}%</span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Zoom in"
+                  title="Zoom in"
+                  onClick={() => setZoom((v) => Math.min(200, v + 25))}
+                >
+                  <Plus />
+                </Button>
+                <span className="toolbar-divider" />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Reset zoom"
+                  title="Reset zoom"
+                  onClick={() => setZoom(100)}
+                >
+                  <RefreshCw />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Fit drawing"
+                  title="Fit drawing"
+                  onClick={() => setZoom(100)}
+                >
+                  <Maximize2 />
+                </Button>
+              </div>
+              <label className="box-toggle">
+                <span>Bounding boxes</span>
+                <Switch aria-label="Bounding boxes" checked={boxes} onCheckedChange={setBoxes} />
+              </label>
+            </div>
+            <div className="source-canvas">
+              {sourcePdfUrl ? (
+                <iframe
+                  className="source-pdf-frame"
+                  src={`${sourcePdfUrl}#page=1&toolbar=0&navpanes=0&view=Fit`}
+                  title={`Uploaded source drawing: ${projectName}`}
+                  style={{
+                    position: "absolute",
+                    inset: 0,
+                    width: "100%",
+                    height: "100%",
+                    border: 0,
+                  }}
+                />
+              ) : (
+                <SourceDiagram
+                  selected={active}
+                  onSelect={selectSource}
+                  onHover={setHovered}
+                  boxes={boxes}
+                  zoom={zoom}
+                  locating={locating}
+                />
+              )}
+              <div className="canvas-scale">
+                <span className="status-dot matched" />
+                4K SOURCE
+                <span className="canvas-scale-divider" />
+                4096 × 3072
+              </div>
+              <Button
+                variant="outline"
+                size="icon"
+                className="canvas-expand"
+                aria-label="Expand source viewer"
+                title="Expand source viewer"
+                onClick={() => setExpanded(expanded === "source" ? null : "source")}
+              >
+                {expanded === "source" ? <X /> : <Maximize2 />}
+              </Button>
+              {locating && (
+                <div className="locating-banner">
+                  <Crosshair size={14} />
+                  Locating tag
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Cancel locating"
+                    onClick={() => setLocating(false)}
+                  >
+                    <X />
+                  </Button>
+                </div>
+              )}
+            </div>
+            <div className="viewer-footer">
+              <span>
+                <span className="legend-square equipment-legend" />
+                Equipment
+                <span className="legend-square tag-legend" />
+                I/O tags
+              </span>
+              <span>
+                <Crosshair size={12} />
+                {active ? `${active} selected` : `${matchedCount} detected regions`}
+              </span>
+            </div>
+          </div>
+
+          <div className="viewer-bridge">
+            <ArrowLeftRight size={15} />
+          </div>
+
+          <div className={`viewer pfd-viewer ${expanded === "pfd" ? "expanded-viewer" : ""}`}>
+            <div className="viewer-heading">
+              <div>
+                <GitBranch size={16} />
+                <h3>Simplified process sketch</h3>
+              </div>
+              <span className="pfd-badge">PFD</span>
+              <span className="validated-badge">
+                <CheckCircle2 size={12} />
+                Graph validated
+              </span>
+            </div>
+            <div className="view-tabs" role="tablist" aria-label="Process view">
+              <Button
+                variant="ghost"
+                role="tab"
+                aria-selected={view === "pfd"}
+                className={view === "pfd" ? "active-tab" : ""}
+                onClick={() => setView("pfd")}
+              >
+                <Network size={13} />
+                Simplified PFD
+              </Button>
+              <Button
+                variant="ghost"
+                role="tab"
+                aria-selected={view === "topology"}
+                className={view === "topology" ? "active-tab" : ""}
+                onClick={() => setView("topology")}
+              >
+                <GitBranch size={13} />
+                Full topology
+              </Button>
+              <Button
+                variant="ghost"
+                role="tab"
+                aria-selected={view === "audit"}
+                className={view === "audit" ? "active-tab" : ""}
+                onClick={() => setView("audit")}
+              >
+                <Layers size={13} />
+                Tag audit table
+              </Button>
+            </div>
+            <div className="pfd-canvas">
+              {view === "audit" ? (
+                auditTable(true)
+              ) : (
+                <ProcessDiagram
+                  selected={active}
+                  onSelect={setSelected}
+                  onHover={setHovered}
+                  topology={view === "topology"}
+                  nodes={graphNodes}
+                  edges={graphEdges}
+                />
+              )}
+              <Button
+                variant="outline"
+                size="icon"
+                className="canvas-expand"
+                aria-label="Expand process viewer"
+                title="Expand process viewer"
+                onClick={() => setExpanded(expanded === "pfd" ? null : "pfd")}
+              >
+                {expanded === "pfd" ? <X /> : <Maximize2 />}
+              </Button>
+            </div>
+            <div className="viewer-footer">
+              <span>
+                <span className="legend-line" />
+                Process flow
+                <span className="legend-square collapsed-legend" />
+                Collapsed control loops
+              </span>
+              <span className="success-text">
+                <CheckCircle2 size={12} />
+                {workspaceMetrics.changedEdges} broken edges
+              </span>
+            </div>
+          </div>
+        </section>
+
+        <div className={`traceability-strip ${active ? "trace-active" : ""}`}>
+          <Link2 size={14} />
+          <span>
+            {active ? (
+              <>
+                <b>{active}</b>
+                <span className="trace-detail">
+                  {" "}
+                  linked across source drawing and process sketch
+                </span>
+              </>
+            ) : (
+              <>
+                Source-linked equipment{" "}
+                <span className="trace-detail">
+                  · Exact tags. Preserved connections. Complete traceability.
+                </span>
+              </>
+            )}
+          </span>
+          <span className="trace-strip-right">
+            <ShieldCheck size={13} />
+            Engineering integrity preserved
+          </span>
+        </div>
+
+        <section className="audit-section">
+          <div className="audit-heading">
+            <Button
+              variant="ghost"
+              className="audit-collapse"
+              onClick={() => setAuditOpen(!auditOpen)}
+              aria-expanded={auditOpen}
+            >
+              <ShieldCheck size={17} />
+              <h2>Tag check & completeness audit</h2>
+              <span className="audit-record-count">{workspaceMetrics.total} tags</span>
+              {auditOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+            </Button>
+            <div className="audit-summary">
+              <span>
+                <span className="status-dot matched" />
+                {matchedCount} matched
+              </span>
+              <span>
+                <span className="status-dot missing" />
+                {missingCount} missing
+              </span>
+              <span>
+                <span className="status-dot pending" />
+                {queue.length} pending
+              </span>
+            </div>
+          </div>
+          {auditOpen && (
+            <>
+              <div className="audit-toolbar">
+                <div className="audit-filters" role="tablist" aria-label="Tag status filter">
+                  {[
+                    { id: "all", label: "All tags", count: String(tags.length) },
+                    { id: "matched", label: "Matched", count: String(matchedCount) },
+                    { id: "missing", label: "Missing", count: String(missingCount) },
+                    { id: "pending", label: "Pending review", count: String(pendingCount) },
+                  ].map((f) => (
+                    <Button
+                      key={f.id}
+                      role="tab"
+                      aria-selected={filter === f.id}
+                      variant="ghost"
+                      size="sm"
+                      className={filter === f.id ? "active-filter" : ""}
+                      onClick={() => setFilter(f.id)}
+                    >
+                      {f.label}
+                      <span>{f.count}</span>
+                    </Button>
+                  ))}
+                </div>
+                <div className="audit-search">
+                  <Search size={14} />
+                  <input
+                    aria-label="Search tags"
+                    placeholder="Search tags…"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                  />
+                </div>
+              </div>
+              {auditTable()}
+              <div className="audit-bottom">
+                <span>
+                  Showing {filtered.length} records of {tags.length} tags
+                </span>
+                <span>
+                  <FileText size={12} />
+                  Reference: {excelName}
+                  <span className="reference-badge">{liveConnected ? "LIVE" : "DEMO"}</span>
+                </span>
+              </div>
+            </>
+          )}
+        </section>
+
+        <footer className="workspace-footer">
+          <span>
+            <span className="status-dot matched" />
+            Pipeline {liveConnected ? "live" : "demo"}
+            <span className="footer-separator">/</span>
+            <span>FastAPI + YOLOv11 + PaddleOCR + D3.js</span>
+          </span>
+          <span>
+            <Zap size={12} />
+            TensorRT active
+            <span className="footer-separator">/</span>
+            <span>UNTANGLE ENGINE v1.0</span>
+            <CircleHelp size={14} />
+          </span>
+        </footer>
+      </main>
+
+      {notice && (
+        <div className="notification" role="status">
+          <CheckCircle2 size={17} />
+          <span>{notice}</span>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Dismiss notification"
+            onClick={() => setNotice("")}
+          >
+            <X />
+          </Button>
+        </div>
+      )}
+
+      <Dialog open={queueOpen} onOpenChange={setQueueOpen}>
+        <DialogContent className="clarification-modal">
+          <div className="modal-eyebrow">
+            <TriangleAlert size={14} />
+            PRE-RENDER CLARIFICATION
+          </div>
+          <DialogTitle>
+            Ambiguity resolution queue{" "}
+            <span className="muted-text">
+              ({current ? queueIndex + 1 : 0} of {queue.length})
+            </span>
+          </DialogTitle>
+          <DialogDescription>
+            {current
+              ? "Verify this connection before finalising the process graph."
+              : "All intersections have been reviewed for this session."}
+          </DialogDescription>
+          {current ? (
+            <>
+              <IntersectionCrop resolution={activeOption || resolution} />
+              <div className="intersection-meta">
+                <span className="mono">ITEM {current.id}</span>
+                <span>
+                  <Crosshair size={12} />
+                  Near {current.near}
+                </span>
+              </div>
+              <p className="clarification-question">{current.question}</p>
+              <fieldset className="resolution-options">
+                <legend className="sr-only">Intersection resolution</legend>
+                {current.options.map((option) => {
+                  const value: Resolution = /unresolved|flagged|not sure/i.test(option)
+                    ? "unresolved"
+                    : /junction|tee/i.test(option) &&
+                        !/non-connecting|crossover|bridge/i.test(option)
+                      ? "junction"
+                      : "bridge";
+                  const isSelected = activeOption === option;
+                  return (
+                    <label key={option} className={isSelected ? "selected-option" : ""}>
+                      <input
+                        type="radio"
+                        name="resolution"
+                        value={option}
+                        checked={isSelected}
+                        onChange={() => {
+                          setSelectedOption(option);
+                          setResolution(value);
+                        }}
+                      />
+                      <div>
+                        <span>{option}</span>
+                        <small>
+                          {option === current.defaultRecommendation
+                            ? `Recommended · ${current.confidence}% confidence`
+                            : value === "unresolved"
+                              ? "Retain in the clarification queue"
+                              : "Apply to graph topology"}
+                        </small>
+                      </div>
+                      {option === current.defaultRecommendation && (
+                        <span className="recommended-icon">
+                          <Zap size={14} />
+                        </span>
+                      )}
+                    </label>
+                  );
+                })}
+              </fieldset>
+              <div className="modal-footer">
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    const nextIndex = (queueIndex + 1) % queue.length;
+                    setQueueIndex(nextIndex);
+                    setResolution("bridge");
+                    if (queue[nextIndex])
+                      setSelectedOption(resolutionToOption(queue[nextIndex], "bridge"));
+                  }}
+                >
+                  Skip
+                  <ChevronRight size={14} />
+                </Button>
+                <Button onClick={() => void applyResolution()} disabled={resolving}>
+                  {resolving ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
+                  {resolving ? "Re-validating…" : "Apply & re-validate graph"}
+                </Button>
+              </div>
+              <div className="modal-note">
+                <ShieldCheck size={12} />
+                Original source drawing remains unchanged
+              </div>
+            </>
+          ) : (
+            <div className="queue-empty">
+              <CheckCircle2 size={40} />
+              <h3>All clear. Graph validated.</h3>
+              <Button onClick={() => setQueueOpen(false)}>Return to workspace</Button>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+      <AuthModal open={authReady && !authUser} onAuthenticated={setAuthUser} />
+    </div>
+  );
+}
