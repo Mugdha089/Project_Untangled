@@ -1,5 +1,8 @@
-import { linkHorizontal } from 'd3-shape';
+import { useEffect, useRef, useState } from 'react';
 import type { EquipmentId, GraphEdgeView, GraphNodeView } from '@/lib/untangle-data';
+import { layoutPfd } from '@/lib/pfd-layout';
+
+type PfdZoom = 'auto' | 'fit' | number;
 
 interface DiagramProps {
   selected: EquipmentId | null;
@@ -7,29 +10,8 @@ interface DiagramProps {
   onHover: (id: EquipmentId | null) => void;
 }
 
-const KIND_NAME: Record<string, string> = {
-  tank: 'Tank',
-  pump: 'Pump pair',
-  mixer: 'Mixer',
-  exchanger: 'Heat exchanger',
-  vessel: 'Vessel',
-  valve: 'Valve',
-};
-
-function layoutNodes(nodes: GraphNodeView[]) {
-  const count = Math.max(nodes.length, 1);
-  const width = 600;
-  const margin = 78;
-  const span = width - margin * 2;
-  return nodes.map((node, index) => ({
-    ...node,
-    x: count === 1 ? width / 2 : margin + (span * index) / (count - 1),
-    name: node.name || KIND_NAME[node.kind] || node.kind,
-  }));
-}
-
 export function EquipmentSymbol({ kind, x = 0, y = 0 }: { kind: string; x?: number; y?: number }) {
-  const symbol = kind === 'tank' || kind === 'pump' || kind === 'mixer' || kind === 'exchanger' || kind === 'vessel' || kind === 'valve' ? kind : 'pump';
+  const symbol = kind === 'tank' || kind === 'pump' || kind === 'mixer' || kind === 'exchanger' || kind === 'vessel' || kind === 'valve' || kind === 'filter' || kind === 'junction' ? kind : 'pump';
   return (
     <g transform={`translate(${x},${y})`} className="equipment-symbol" fill="none" stroke="currentColor" strokeWidth="1.8">
       {symbol === 'tank' && (
@@ -63,6 +45,13 @@ export function EquipmentSymbol({ kind, x = 0, y = 0 }: { kind: string; x?: numb
         <path d="M-19-22 C-19-40 19-40 19-22 V22 C19 40-19 40-19 22Z M-19-20h38 M-19 20h38 M-12 34v7 M12 34v7" />
       )}
       {symbol === 'valve' && <path d="M-14-10L14 10V-10L-14 10Z" />}
+      {symbol === 'filter' && (
+        <>
+          <rect x="-24" y="-18" width="48" height="36" rx="3" />
+          <path d="M-15-10l30 20 M-15 0l20 13 M-5-13l20 13" />
+        </>
+      )}
+      {symbol === 'junction' && <circle r="5" fill="currentColor" />}
     </g>
   );
 }
@@ -74,26 +63,52 @@ export function ProcessDiagram({
   topology = false,
   nodes,
   edges,
+  zoom = 'auto',
+  onLayoutScaleChange,
 }: DiagramProps & {
   topology?: boolean;
   nodes: GraphNodeView[];
   edges: GraphEdgeView[];
+  zoom?: PfdZoom;
+  onLayoutScaleChange?: (fitScale: number, autoScale: number) => void;
 }) {
-  const curve = linkHorizontal<{ source: [number, number]; target: [number, number] }, [number, number]>()
-    .x(d => d[0])
-    .y(d => d[1]);
-  const laidOut = layoutNodes(nodes);
-  const byId = Object.fromEntries(laidOut.map(n => [n.id, n]));
-  const flowEdges = edges.filter(e => byId[e.source] && byId[e.target]);
+  const layout = layoutPfd(nodes, edges);
+  const byId = new Map(layout.nodes.map(node => [node.id, node]));
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const [canvasSize, setCanvasSize] = useState({ width: 640, height: 371 });
+  useEffect(() => {
+    const canvas = svgRef.current?.closest('.pfd-canvas');
+    if (!canvas || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) setCanvasSize({ width: entry.contentRect.width, height: entry.contentRect.height });
+    });
+    observer.observe(canvas);
+    return () => observer.disconnect();
+  }, []);
+  const fitScale = Math.min(1, canvasSize.width / layout.width, canvasSize.height / layout.height);
+  const autoScale = layout.width > 900 ? 1 : fitScale;
+  useEffect(() => {
+    onLayoutScaleChange?.(fitScale, autoScale);
+  }, [autoScale, fitScale, onLayoutScaleChange]);
+  const scale = zoom === 'auto'
+    ? autoScale
+    : zoom === 'fit'
+      ? fitScale
+      : zoom / 100;
+  const diagramWidth = layout.width * scale;
+  const diagramHeight = layout.height * scale;
+  const equipmentCount = layout.nodes.filter(node => node.kind !== 'junction').length;
 
   return (
-    <svg
-      id="process-diagram"
-      viewBox="0 0 600 350"
-      className="process-svg"
-      role="img"
-      aria-label={topology ? 'Full process topology graph' : 'Simplified process flow diagram'}
-    >
+    <div className="pfd-diagram" style={{ width: diagramWidth, height: diagramHeight }}>
+      <svg
+        ref={svgRef}
+        id="process-diagram"
+        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        className="process-svg"
+        role="img"
+        aria-label={topology ? 'Full process topology graph' : 'Simplified process flow diagram'}
+      >
       <defs>
         <marker id="flow-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
           <path d="M0 0L7 3.5 0 7" className="arrow-fill" />
@@ -102,41 +117,28 @@ export function ProcessDiagram({
           <circle cx="1" cy="1" r=".65" className="grid-dot" />
         </pattern>
       </defs>
-      <rect width="600" height="350" className="diagram-bg" />
-      <rect width="600" height="350" fill="url(#pfd-grid)" />
+      <rect width={layout.width} height={layout.height} className="diagram-bg" />
+      <rect width={layout.width} height={layout.height} fill="url(#pfd-grid)" />
       <text x="25" y="32" className="diagram-eyebrow">
-        {topology ? `COMPLETE TOPOLOGY / ${laidOut.length} NODES` : 'PROCESS STREAM / MAIN LINE'}
+        {topology
+          ? `SOURCE GEOMETRY TOPOLOGY / ${layout.nodes.length} NODES`
+          : 'PROCESS CONNECTIONS / SOURCE GEOMETRY'}
       </text>
-      <text x="575" y="32" textAnchor="end" className="diagram-small">
+      <text x={layout.width - 25} y="32" textAnchor="end" className="diagram-small">
         PFD-001
       </text>
-      {flowEdges.map((edge, i) => {
-        const source = byId[edge.source]!;
-        const target = byId[edge.target]!;
+      {layout.routes.map(({ edge, path, recycle }) => {
         return (
           <g key={edge.id}>
             <path
-              d={curve({ source: [source.x + 45, 165], target: [target.x - 46, 165] }) ?? ''}
-              className="flow-path"
-              markerEnd="url(#flow-arrow)"
+              d={path}
+              className={`flow-path${recycle ? ' recycle-path' : ''}`}
+              markerEnd={edge.flowDirection === 'undirected' ? undefined : 'url(#flow-arrow)'}
             />
-            <text x={(source.x + target.x) / 2} y="151" className="flow-label" textAnchor="middle">
-              {['FEED', 'PROCESS', 'PRODUCT', 'STREAM'][i] ?? 'FLOW'}
-            </text>
           </g>
         );
       })}
-      {laidOut.length > 0 && (
-        <>
-          <path d={`M20 165h${Math.max(0, laidOut[0]!.x - 66)}`} className="flow-path" markerEnd="url(#flow-arrow)" />
-          <path
-            d={`M${laidOut[laidOut.length - 1]!.x + 46} 165h${Math.max(0, 580 - (laidOut[laidOut.length - 1]!.x + 46))}`}
-            className="flow-path"
-            markerEnd="url(#flow-arrow)"
-          />
-        </>
-      )}
-      {laidOut.map((node, i) => (
+      {layout.nodes.map(node => (
         <g
           key={node.id}
           className={`diagram-node ${selected === node.id ? 'is-selected' : ''}`}
@@ -153,9 +155,16 @@ export function ProcessDiagram({
           onMouseEnter={() => onHover(node.id)}
           onMouseLeave={() => onHover(null)}
         >
-          <rect x={node.x - 43} y="116" width="86" height="98" rx="7" className="node-hit" />
+          <rect
+            x={node.x - (node.kind === 'junction' ? 14 : 37)}
+            y={node.y - (node.kind === 'junction' ? 14 : 44)}
+            width={node.kind === 'junction' ? 28 : 74}
+            height={node.kind === 'junction' ? 28 : 88}
+            rx="7"
+            className="node-hit"
+          />
           {node.dutyStandby ? (
-            <g transform={`translate(${node.x},165)`}>
+            <g transform={`translate(${node.x},${node.y})`}>
               <g transform="translate(-20,0) scale(.65)">
                 <EquipmentSymbol kind="pump" />
               </g>
@@ -164,46 +173,44 @@ export function ProcessDiagram({
               </g>
             </g>
           ) : (
-            <EquipmentSymbol kind={node.kind} x={node.x} y={165} />
+            <EquipmentSymbol kind={node.kind} x={node.x} y={node.y} />
           )}
-          <text x={node.x} y="96" textAnchor="middle" className="diagram-node-label">
+          <text x={node.x} y={node.y - 58} textAnchor="middle" className="diagram-node-label">
             {node.dutyStandby ? `${node.id}A / ${node.id}B` : node.id}
           </text>
-          <text x={node.x} y="232" textAnchor="middle" className="diagram-node-name">
-            {node.name}
-          </text>
-          <rect x={node.x - 60} y="250" width="120" height="23" rx="4" className="metadata-bg" />
-          <text x={node.x} y="265" textAnchor="middle" className="metadata-text">
-            {node.tags}
-          </text>
-          <circle cx={node.x + 32} cy="124" r="3" className="verified-dot" />
+          {node.kind !== 'junction' && (
+            <>
+              <text x={node.x} y={node.y + 44} textAnchor="middle" className="diagram-node-name">
+                {node.name}
+              </text>
+              <rect x={node.x - 60} y={node.y + 59} width="120" height="23" rx="4" className="metadata-bg" />
+              <text x={node.x} y={node.y + 74} textAnchor="middle" className="metadata-text">
+                {node.tags}
+              </text>
+              <circle cx={node.x + 32} cy={node.y - 41} r="3" className="verified-dot" />
+            </>
+          )}
           {topology && (
             <>
-              <path d={`M${node.x} 116V67`} className="instrument-line" />
-              <circle cx={node.x} cy="57" r="15" className="topology-instrument" />
-              <text x={node.x} y="60" textAnchor="middle" className="metadata-text">
-                {['PT', 'FT', 'TT', 'LT'][i % 4]}
-              </text>
-              <path d={`M${node.x} 273v25`} className="instrument-line" />
-              <circle cx={node.x} cy="309" r="12" className="topology-instrument" />
-              <text x={node.x} y="312" textAnchor="middle" className="metadata-text">
-                {['LV', 'XV', 'TV', 'PV'][i % 4]}
-              </text>
+              <title>{node.sourceBounds ? `PDF page ${node.sourcePage ?? 0} coordinates ${node.sourceBounds.join(', ')}` : node.label}</title>
             </>
           )}
         </g>
       ))}
       {!topology && (
         <>
-          <text x="25" y="326" className="diagram-small">
-            {laidOut.length} EQUIPMENT GROUPS
+          <text x="25" y={layout.height - 24} className="diagram-small">
+            {equipmentCount} EQUIPMENT ITEMS
           </text>
-          <text x="575" y="326" textAnchor="end" className="diagram-small">
-            FLOW DIRECTION →
+          <text x={layout.width - 25} y={layout.height - 24} textAnchor="end" className="diagram-small">
+            {edges.some(edge => edge.flowDirection === 'undirected')
+              ? 'FLOW DIRECTION UNRESOLVED'
+              : 'FLOW DIRECTION →'}
           </text>
         </>
       )}
-    </svg>
+      </svg>
+    </div>
   );
 }
 

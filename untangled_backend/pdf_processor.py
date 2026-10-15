@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,7 @@ TAG_RE = re.compile(
 )
 
 EQUIPMENT_RE = re.compile(
-    r"\b(TK|T|P|M|R|E|V|HX)[-\s_]?(\d{2,4}[A-Z]?)\b",
+    r"\b(FCV|TK|HX|FV|LV|XV|PV|HV|T|P|M|R|E|V|F)[-\s_]?(\d{2,4}[A-Z]?)\b",
     re.IGNORECASE,
 )
 
@@ -148,8 +149,6 @@ SAMPLE_TAGS: List[Dict[str, Any]] = [
     },
 ]
 
-MISSING_TAGS_WHEN_TEXT_UNAVAILABLE = {"PT-105", "LT-201"}
-
 SAMPLE_CLARIFICATIONS: List[Dict[str, Any]] = [
     {
         "id": "amb_04",
@@ -213,15 +212,19 @@ def _canonical_tag(prefix: str, number: str) -> str:
     return f"{prefix.upper()}-{number.upper()}"
 
 
-def _extract_embedded_text(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+def _extract_embedded_text(
+    doc: Any,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int, bool]:
     """Extract tags and equipment candidates from embedded PDF text blocks."""
     tags: List[Dict[str, Any]] = []
     equipment: List[Dict[str, Any]] = []
     seen_tags: set = set()
     seen_eq: set = set()
+    has_embedded_text = False
 
     for page_index in range(len(doc)):
         page = doc[page_index]
+        shape_bounds = _page_shape_bounds(page)
         blocks = page.get_text("dict").get("blocks", [])
         for block in blocks:
             if block.get("type") != 0:
@@ -233,6 +236,7 @@ def _extract_embedded_text(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[st
                 text = "".join(span.get("text", "") for span in spans).strip()
                 if not text:
                     continue
+                has_embedded_text = True
                 # Aggregate span bbox.
                 xs1, ys1, xs2, ys2 = [], [], [], []
                 for span in spans:
@@ -243,13 +247,56 @@ def _extract_embedded_text(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[st
                     ys2.append(bx[3])
                 bbox = _bbox_to_ints((min(xs1), min(ys1), max(xs2), max(ys2)))
 
-                for match in TAG_RE.finditer(text):
+                # Restrict detections to tag-like text lines. This prevents tags
+                # quoted in captions or explanatory notes from becoming evidence.
+                tag_match = TAG_RE.fullmatch(text)
+                if tag_match is None:
+                    continue
+
+                equipment_match = EQUIPMENT_RE.fullmatch(text)
+                equipment_type = None
+                if equipment_match is not None:
+                    prefix = equipment_match.group(1).upper()
+                    equipment_type = _equipment_type_from_prefix(prefix)
+                    if equipment_type is None:
+                        equipment_type = _equipment_type_from_context(
+                            prefix,
+                            bbox,
+                            blocks,
+                            shape_bounds,
+                        )
+
+                tag = _canonical_tag(tag_match.group(1), tag_match.group(2))
+                if equipment_type is not None:
+                    equipment_prefix = equipment_match.group(1).upper()
+                    number = equipment_match.group(2).upper()
+                    if equipment_prefix == "T":
+                        equipment_prefix = "TK"
+                    if equipment_prefix == "HX":
+                        equipment_prefix = "E"
+                    tag = f"{equipment_prefix}-{number}"
+                    if tag not in seen_eq:
+                        seen_eq.add(tag)
+                        equipment.append(
+                            {
+                                "id": f"eq_{tag.lower().replace('-', '')}",
+                                "tag": tag,
+                                "type": equipment_type,
+                                "label": f"{equipment_type.title()} {tag}",
+                                "source_bbox": bbox,
+                                "source_page": page_index,
+                                "source_symbol_bbox": _nearest_shape_bbox(
+                                    bbox, shape_bounds
+                                ),
+                                "confidence": 0.90,
+                                "page": page_index,
+                            }
+                        )
+                    continue
+
+                for match in [tag_match]:
                     tag = _canonical_tag(match.group(1), match.group(2))
-                    # Skip pure equipment prefixes that look like instrument tags
-                    # when they are major equipment labels handled below.
                     if tag in seen_tags:
-                        continue
-                    if match.group(1).upper() in {"TK", "HX"}:
                         continue
                     seen_tags.add(tag)
                     tags.append(
@@ -257,40 +304,97 @@ def _extract_embedded_text(doc: Any) -> Tuple[List[Dict[str, Any]], List[Dict[st
                             "tag_name": tag,
                             "type": _infer_instrument_type(tag),
                             "source_bbox": bbox,
+                            "source_page": page_index,
                             "confidence": 0.92,
                             "page": page_index,
                             "parent_equipment": None,
                         }
                     )
 
-                for match in EQUIPMENT_RE.finditer(text):
-                    prefix = match.group(1).upper()
-                    number = match.group(2).upper()
-                    # Normalise T-101 → TK-101, HX-102 → E-102 when useful.
-                    if prefix == "T":
-                        prefix = "TK"
-                    if prefix == "HX":
-                        prefix = "E"
-                    tag = f"{prefix}-{number}"
-                    if tag in seen_eq:
-                        continue
-                    eq_type = _equipment_type_from_prefix(prefix)
-                    if eq_type is None:
-                        continue
-                    seen_eq.add(tag)
-                    equipment.append(
-                        {
-                            "id": f"eq_{tag.lower().replace('-', '')}",
-                            "tag": tag,
-                            "type": eq_type,
-                            "label": f"{eq_type.title()} {tag}",
-                            "source_bbox": bbox,
-                            "confidence": 0.90,
-                            "page": page_index,
-                        }
-                    )
+    return tags, equipment, len(doc), has_embedded_text
 
-    return tags, equipment, len(doc)
+
+def _page_shape_bounds(page: Any) -> List[Tuple[float, float, float, float]]:
+    """Return non-line vector bounds suitable for nearby symbol evidence."""
+    shapes = []
+    for drawing in page.get_drawings():
+        items = drawing.get("items", [])
+        if not items:
+            continue
+        rect = drawing.get("rect")
+        if rect is None:
+            continue
+        x1, y1, x2, y2 = (float(value) for value in rect)
+        if 8 <= x2 - x1 <= 150 and 8 <= y2 - y1 <= 150:
+            shapes.append((x1, y1, x2, y2))
+    return shapes
+
+
+def _bbox_gap(
+    first: Tuple[float, float, float, float],
+    second: Tuple[float, float, float, float],
+) -> float:
+    dx = max(first[0] - second[2], second[0] - first[2], 0.0)
+    dy = max(first[1] - second[3], second[1] - first[3], 0.0)
+    return math.hypot(dx, dy)
+
+
+def _nearest_shape_bbox(
+    bbox: List[int],
+    shapes: List[Tuple[float, float, float, float]],
+) -> Optional[List[int]]:
+    text_box = tuple(float(value) for value in bbox)
+    candidates = [
+        shape
+        for shape in shapes
+        if 8 <= shape[2] - shape[0] <= 150 and 8 <= shape[3] - shape[1] <= 150
+    ]
+    if not candidates:
+        return None
+    nearest = min(candidates, key=lambda shape: _bbox_gap(text_box, shape))
+    if _bbox_gap(text_box, nearest) > 55:
+        return None
+    return _bbox_to_ints(nearest)
+
+
+def _equipment_type_from_context(
+    prefix: str,
+    bbox: List[int],
+    blocks: List[Dict[str, Any]],
+    shapes: List[Tuple[float, float, float, float]],
+) -> Optional[str]:
+    """Use nearby PDF labels and vector symbols to disambiguate equipment tags."""
+    text_box = tuple(float(value) for value in bbox)
+    nearby_text = []
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            line_text = "".join(
+                span.get("text", "") for span in line.get("spans", [])
+            ).strip()
+            if not line_text or TAG_RE.fullmatch(line_text):
+                continue
+            line_bbox = tuple(
+                float(value)
+                for value in line.get("spans", [])[0].get("bbox", (0, 0, 0, 0))
+            )
+            if _bbox_gap(text_box, line_bbox) <= 45:
+                nearby_text.append(line_text.lower())
+
+    description = " ".join(nearby_text)
+    if prefix == "F" and "filter" in description:
+        return "filter"
+    if prefix in {"FCV", "FV", "LV", "XV", "PV", "HV"}:
+        if "valve" in description:
+            return "valve"
+        symbol = _nearest_shape_bbox(bbox, shapes)
+        if symbol is not None:
+            width = symbol[2] - symbol[0]
+            height = symbol[3] - symbol[1]
+            if 8 <= width <= 45 and 8 <= height <= 40:
+                return "valve"
+    return None
 
 
 def _infer_instrument_type(tag: str) -> str:
@@ -315,87 +419,119 @@ def _infer_instrument_type(tag: str) -> str:
 def _equipment_type_from_prefix(prefix: str) -> Optional[str]:
     mapping = {
         "TK": "tank",
+        "T": "tank",
         "P": "pump",
         "M": "mixer",
         "R": "vessel",
         "E": "exchanger",
         "V": "vessel",
+        "HX": "exchanger",
     }
     return mapping.get(prefix)
 
 
-def _infer_equipment_from_excel(
-    excel_tags: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Build equipment candidates from equipment-style tags in the Excel inventory."""
-    equipment: List[Dict[str, Any]] = []
-    seen: set = set()
-
-    for row in excel_tags:
-        tag_name = str(row.get("tag_name", "")).strip().upper()
-        match = EQUIPMENT_RE.fullmatch(tag_name)
-        if not match:
-            continue
-
-        prefix = match.group(1).upper()
-        number = match.group(2).upper()
-        if prefix == "T":
-            prefix = "TK"
-        elif prefix == "HX":
-            prefix = "E"
-        tag = f"{prefix}-{number}"
-        if tag in seen:
-            continue
-
-        equipment_type = _equipment_type_from_prefix(prefix)
-        if equipment_type is None:
-            continue
-
-        seen.add(tag)
-        label_type = {"M": "Mixer", "R": "Reactor"}.get(
-            prefix, equipment_type.title()
-        )
-        equipment.append(
-            {
-                "id": f"eq_{tag.lower().replace('-', '')}",
-                "tag": tag,
-                "type": equipment_type,
-                "label": f"{label_type} {tag}",
-                "source_bbox": [0, 0, 0, 0],
-                "confidence": 0.5,
-                "page": 0,
-            }
-        )
-
-    return equipment
+def _drawing_style_key(drawing: Dict[str, Any]) -> Tuple[Any, ...]:
+    color = drawing.get("color")
+    normalized_color = (
+        tuple(round(float(value), 3) for value in color)
+        if color is not None
+        else None
+    )
+    return (
+        normalized_color,
+        str(drawing.get("dashes") or "").strip(),
+        round(float(drawing.get("width") or 0.0), 3),
+    )
 
 
-def _infer_tags_from_excel(
-    excel_tags: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Use inventory rows as detections when the PDF contains no extractable text."""
-    tags: List[Dict[str, Any]] = []
-    seen: set = set()
+def _extract_drawing_evidence(doc: Any) -> Dict[str, Any]:
+    """Classify vector line styles from nearby drawing-legend labels."""
+    segments: List[Dict[str, Any]] = []
 
-    for row in excel_tags:
-        tag_name = str(row.get("tag_name", "")).strip().upper()
-        if not tag_name or tag_name in seen:
-            continue
-        seen.add(tag_name)
-        missing = tag_name in MISSING_TAGS_WHEN_TEXT_UNAVAILABLE
-        tags.append(
-            {
-                "tag_name": tag_name,
-                "type": row.get("type") or _infer_instrument_type(tag_name),
-                "source_bbox": [0, 0, 0, 0],
-                "confidence": 0.0 if missing else 0.9,
-                "page": 0,
-                "parent_equipment": None,
-                "missing": missing,
-            }
-        )
+    for page_index in range(len(doc)):
+        page = doc[page_index]
+        drawings = page.get_drawings()
+        legend_styles: Dict[Tuple[Any, ...], str] = {}
+        text_lines = []
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                text = "".join(span.get("text", "") for span in spans).strip()
+                if text and spans:
+                    text_lines.append(
+                        (
+                            text.lower(),
+                            tuple(float(value) for value in spans[0]["bbox"]),
+                        )
+                    )
 
-    return tags
+        for label, label_bbox in text_lines:
+            if "utility" in label and "line" in label:
+                kind = "utility"
+            elif "signal" in label and "instrument" in label:
+                kind = "instrument_signal"
+            elif "process" in label and ("line" in label or "pipe" in label):
+                kind = "process"
+            else:
+                continue
+
+            candidates = []
+            label_y = (label_bbox[1] + label_bbox[3]) / 2
+            for drawing in drawings:
+                for item in drawing.get("items", []):
+                    if item[0] != "l":
+                        continue
+                    start = tuple(float(value) for value in item[1])
+                    end = tuple(float(value) for value in item[2])
+                    if abs(start[1] - end[1]) > 1.5:
+                        continue
+                    left, right = sorted((start[0], end[0]))
+                    gap = label_bbox[0] - right
+                    y_gap = abs((start[1] + end[1]) / 2 - label_y)
+                    if -2 <= gap <= 25 and y_gap <= 6 and right - left >= 12:
+                        candidates.append((gap + y_gap, _drawing_style_key(drawing)))
+            if candidates:
+                _, key = min(candidates, key=lambda candidate: candidate[0])
+                previous = legend_styles.get(key)
+                legend_styles[key] = kind if previous in (None, kind) else "ambiguous"
+
+        for drawing in drawings:
+            style_key = _drawing_style_key(drawing)
+            kind = legend_styles.get(style_key)
+            if kind is None or kind == "ambiguous":
+                continue
+            for item in drawing.get("items", []):
+                if item[0] != "l":
+                    continue
+                start = tuple(float(value) for value in item[1])
+                end = tuple(float(value) for value in item[2])
+                if math.dist(start, end) < 4:
+                    continue
+                segments.append(
+                    {
+                        "page": page_index,
+                        "start": [round(start[0], 3), round(start[1], 3)],
+                        "end": [round(end[0], 3), round(end[1], 3)],
+                        "kind": kind,
+                        "source_bbox": _bbox_to_ints(
+                            (
+                                min(start[0], end[0]),
+                                min(start[1], end[1]),
+                                max(start[0], end[0]),
+                                max(start[1], end[1]),
+                            )
+                        ),
+                    }
+                )
+
+    return {
+        "segments": segments,
+        "classified_process_lines": sum(
+            1 for segment in segments if segment["kind"] == "process"
+        ),
+    }
 
 
 def _merge_with_sample(
@@ -479,8 +615,13 @@ def match_excel_inventory(
     for excel_row in excel_tags:
         name = excel_row["tag_name"]
         detected = pdf_index.get(name)
+        bbox = detected.get("source_bbox") if detected else None
 
-        if detected is None or detected.get("missing"):
+        if (
+            detected is None
+            or detected.get("missing")
+            or not _has_valid_source_bbox(bbox)
+        ):
             audit.append(
                 {
                     "tag_name": name,
@@ -489,6 +630,7 @@ def match_excel_inventory(
                     "excel_row": excel_row["excel_row"],
                     "status": "Missing in P&ID",
                     "confidence": 0.0,
+                    "source_page": None,
                     "parent_equipment": detected.get("parent_equipment") if detected else None,
                 }
             )
@@ -498,10 +640,11 @@ def match_excel_inventory(
             {
                 "tag_name": name,
                 "type": excel_row.get("type") or detected.get("type", "Instrument"),
-                "source_bbox": list(detected.get("source_bbox") or [0, 0, 0, 0]),
+                "source_bbox": list(bbox),
                 "excel_row": excel_row["excel_row"],
                 "status": "Matched",
                 "confidence": float(detected.get("confidence", 0.9)),
+                "source_page": detected.get("source_page", detected.get("page")),
                 "parent_equipment": detected.get("parent_equipment"),
             }
         )
@@ -519,6 +662,7 @@ def match_excel_inventory(
                 "excel_row": 0,
                 "status": "Ambiguous",
                 "confidence": float(tag.get("confidence", 0.5)),
+                "source_page": tag.get("source_page", tag.get("page")),
                 "parent_equipment": tag.get("parent_equipment"),
             }
         )
@@ -526,27 +670,59 @@ def match_excel_inventory(
     return audit
 
 
+def _has_valid_source_bbox(bbox: Any) -> bool:
+    """Return whether a detection has a finite, non-empty source rectangle."""
+    if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+        return False
+    try:
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return False
+    return (
+        all(math.isfinite(value) for value in (x1, y1, x2, y2))
+        and x1 >= 0
+        and y1 >= 0
+        and x2 > x1
+        and y2 > y1
+    )
+
+
 def process_pdf(
     file_bytes: bytes,
     filename: str = "pid.pdf",
     excel_tags: Optional[List[Dict[str, Any]]] = None,
+    demo_mode: bool = False,
 ) -> Dict[str, Any]:
     """
     Render/extract a P&ID PDF and return equipment, tags, clarifications, page count.
 
-    Uses PyMuPDF embedded text when available. With an Excel inventory, empty
-    text extraction falls back to inventory-derived tags and equipment; sample
-    P&ID entities are used only when no inventory is supplied.
+    Uses PyMuPDF embedded text when available. Inventory data is never treated
+    as PDF evidence. Sample entities are included only when demo_mode is true.
     """
+    if excel_tags is not None:
+        logger.debug(
+            "Excel inventory supplied for compatibility only; PDF extraction "
+            "does not use it as evidence (%d rows)",
+            len(excel_tags),
+        )
     page_count = 1
     extracted_tags: List[Dict[str, Any]] = []
     extracted_equipment: List[Dict[str, Any]] = []
+    drawing_evidence: Dict[str, Any] = {
+        "segments": [],
+        "classified_process_lines": 0,
+    }
 
     if not file_bytes:
         raise PdfProcessError("PDF file is empty.")
 
     if fitz is None:
-        logger.warning("PyMuPDF (fitz) is not installed; using heuristic fallback only.")
+        if not demo_mode:
+            raise PdfProcessError(
+                "PDF text extraction is unavailable because PyMuPDF is not "
+                "installed; OCR is not configured, so drawing tags cannot be verified."
+            )
+        logger.warning("PyMuPDF (fitz) is not installed; using demo entities.")
     else:
         try:
             doc = fitz.open(stream=io.BytesIO(file_bytes), filetype="pdf")
@@ -557,7 +733,18 @@ def process_pdf(
         try:
             if len(doc) == 0:
                 raise PdfProcessError("PDF contains no pages.")
-            extracted_tags, extracted_equipment, page_count = _extract_embedded_text(doc)
+            (
+                extracted_tags,
+                extracted_equipment,
+                page_count,
+                has_embedded_text,
+            ) = _extract_embedded_text(doc)
+            drawing_evidence = _extract_drawing_evidence(doc)
+            if not has_embedded_text and not demo_mode:
+                raise PdfProcessError(
+                    f"No extractable text found in PDF '{filename}'; OCR is not "
+                    "configured, so drawing tags cannot be verified."
+                )
             logger.info(
                 "Extracted %d text tags and %d equipment labels from '%s' (%d pages)",
                 len(extracted_tags),
@@ -568,21 +755,15 @@ def process_pdf(
         finally:
             doc.close()
 
-    inferred_equipment = (
-        _infer_equipment_from_excel(excel_tags or [])
-        if not extracted_equipment
-        else []
-    )
-    if not extracted_tags and excel_tags is not None:
-        extracted_tags = _infer_tags_from_excel(excel_tags)
-
-    equipment_candidates = extracted_equipment or inferred_equipment
-    tags, equipment = _merge_with_sample(
-        extracted_tags,
-        equipment_candidates,
-        include_sample_tags=excel_tags is None,
-        include_sample_equipment=bool(extracted_equipment) or excel_tags is None,
-    )
+    if demo_mode:
+        tags, equipment = _merge_with_sample(
+            extracted_tags,
+            extracted_equipment,
+            include_sample_tags=True,
+            include_sample_equipment=True,
+        )
+    else:
+        tags, equipment = extracted_tags, extracted_equipment
     _associate_tags_to_equipment(tags, equipment)
 
     return {
@@ -591,4 +772,5 @@ def process_pdf(
         "clarifications": [dict(c) for c in SAMPLE_CLARIFICATIONS],
         "pdf_page_count": page_count,
         "filename": filename,
+        "drawing_evidence": drawing_evidence,
     }

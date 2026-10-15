@@ -8,7 +8,16 @@ from pydantic import BaseModel, Field
 
 
 TagStatus = Literal["Matched", "Missing in P&ID", "Pending Review", "Ambiguous"]
-EquipmentType = Literal["tank", "pump", "mixer", "exchanger", "vessel", "valve"]
+EquipmentType = Literal[
+    "tank",
+    "pump",
+    "mixer",
+    "exchanger",
+    "vessel",
+    "valve",
+    "filter",
+    "junction",
+]
 
 
 class TagAuditItem(BaseModel):
@@ -22,6 +31,7 @@ class TagAuditItem(BaseModel):
         max_length=4,
         description="Bounding box [x1, y1, x2, y2]",
     )
+    source_page: Optional[int] = None
     excel_row: int
     status: TagStatus
     confidence: float = Field(..., ge=0.0, le=1.0)
@@ -35,12 +45,18 @@ class EquipmentNode(BaseModel):
     type: EquipmentType
     label: str
     source_bbox: List[int] = Field(..., min_length=4, max_length=4)
+    source_page: int = 0
+    source_symbol_bbox: Optional[List[int]] = Field(
+        default=None,
+        min_length=4,
+        max_length=4,
+    )
     collapsed_tags: List[str] = Field(default_factory=list)
     duty_standby: bool = False
 
 
 class ProcessEdge(BaseModel):
-    """Directed process-flow connection between equipment nodes."""
+    """Source-supported process connection, directed only when evidence exists."""
 
     id: str
     source: str
@@ -48,6 +64,8 @@ class ProcessEdge(BaseModel):
     flow_direction: str
     relation: str
     confidence: float = Field(..., ge=0.0, le=1.0)
+    source_page: Optional[int] = None
+    source_bbox: Optional[List[int]] = Field(default=None, min_length=4, max_length=4)
 
 
 class ClarificationItem(BaseModel):

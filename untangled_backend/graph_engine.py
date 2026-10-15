@@ -1,8 +1,9 @@
-"""NetworkX process-graph construction, semantic loop reduction, and layout."""
+"""NetworkX process topology built from source-supported PDF line geometry."""
 
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -29,98 +30,36 @@ def _is_loop_instrument(tag: str) -> bool:
     return _tag_prefix(tag) in LOOP_PREFIXES
 
 
-def _duty_standby_pair(
-    equipment: List[Dict[str, Any]],
-) -> Tuple[Optional[Dict[str, Any]], List[str]]:
-    """
-    Detect a duty/standby pump pair (e.g. P-101A / P-101B) and collapse to one node.
-
-    Returns (collapsed_node_dict | None, member_tags).
-    """
-    pumps = [e for e in equipment if e.get("type") == "pump"]
-    groups: Dict[str, List[Dict[str, Any]]] = {}
-    for pump in pumps:
-        group = pump.get("duty_standby_group")
-        if not group:
-            tag = pump.get("tag", "")
-            # Infer group from trailing letter: P-101A → P-101
-            if len(tag) > 1 and tag[-1].isalpha() and tag[-2].isdigit():
-                group = tag[:-1]
-            else:
-                continue
-        groups.setdefault(group, []).append(pump)
-
-    for group_tag, members in groups.items():
-        if len(members) < 2:
-            continue
-        members_sorted = sorted(members, key=lambda m: m.get("tag", ""))
-        tags = [m["tag"] for m in members_sorted]
-        # Use union of bounding boxes.
-        xs1 = [m["source_bbox"][0] for m in members_sorted]
-        ys1 = [m["source_bbox"][1] for m in members_sorted]
-        xs2 = [m["source_bbox"][2] for m in members_sorted]
-        ys2 = [m["source_bbox"][3] for m in members_sorted]
-        bbox = [min(xs1), min(ys1), max(xs2), max(ys2)]
-        node = {
-            "id": f"eq_{group_tag.lower().replace('-', '')}",
-            "tag": group_tag,
-            "type": "pump",
-            "label": f"Duty/Standby Pump Pair [{ ' / '.join(tags) }]",
-            "source_bbox": bbox,
-            "collapsed_tags": [],
-            "duty_standby": True,
-            "member_tags": tags,
-        }
-        return node, tags
-    return None, []
-
-
 def _build_equipment_nodes(
     equipment: List[Dict[str, Any]],
     audit_tags: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Build primary equipment nodes and attach collapsed control-loop tags."""
-    duty_node, duty_members = _duty_standby_pair(equipment)
-    skip_tags = set(duty_members)
-
+    """Build one node per detected item and attach control-loop tags."""
     nodes: List[Dict[str, Any]] = []
-    duty_inserted = False
-
+    seen_tags: Set[str] = set()
     for eq in equipment:
-        if eq.get("tag") in skip_tags:
-            if not duty_inserted and duty_node is not None:
-                nodes.append(duty_node)
-                duty_inserted = True
+        tag = eq.get("tag")
+        if not tag or tag in seen_tags:
+            if tag:
+                logger.warning("Duplicate equipment tag %s was omitted from graph nodes", tag)
             continue
-        # Skip individual pumps already represented by duty/standby node.
-        if eq.get("type") == "pump" and duty_node is not None:
-            group = eq.get("duty_standby_group") or (
-                eq["tag"][:-1]
-                if eq["tag"][-1:].isalpha() and eq["tag"][-2:-1].isdigit()
-                else None
-            )
-            if group == duty_node["tag"]:
-                continue
-
+        seen_tags.add(tag)
         nodes.append(
             {
-                "id": eq.get("id") or f"eq_{eq['tag'].lower().replace('-', '')}",
-                "tag": eq["tag"],
+                "id": eq.get("id") or f"eq_{tag.lower().replace('-', '')}",
+                "tag": tag,
                 "type": eq["type"],
-                "label": eq.get("label") or f"{eq['type'].title()} {eq['tag']}",
+                "label": eq.get("label") or f"{eq['type'].title()} {tag}",
                 "source_bbox": list(eq.get("source_bbox") or [0, 0, 0, 0]),
+                "source_symbol_bbox": list(eq.get("source_symbol_bbox") or []),
+                "source_page": int(eq.get("source_page", eq.get("page", 0))),
                 "collapsed_tags": [],
-                "duty_standby": False,
+                "duty_standby": bool(eq.get("duty_standby_group")),
             }
         )
 
     # Map excel/pdf tags onto nearest primary equipment for loop collapse.
     node_by_tag = {n["tag"]: n for n in nodes}
-    # Also allow mapping member pump tags → duty node.
-    member_to_parent: Dict[str, str] = {}
-    if duty_node is not None:
-        for member in duty_node.get("member_tags", []):
-            member_to_parent[member] = duty_node["tag"]
 
     for audit in audit_tags:
         tag_name = audit.get("tag_name", "")
@@ -130,16 +69,13 @@ def _build_equipment_nodes(
             # Still attach missing tags as collapsed metadata on parent equipment
             # so the I/O list remains visible on the sketch.
             parent = audit.get("parent_equipment")
-            if parent:
-                parent = member_to_parent.get(parent, parent)
-                if parent in node_by_tag and tag_name not in node_by_tag[parent]["collapsed_tags"]:
+            if parent and parent in node_by_tag:
+                if tag_name not in node_by_tag[parent]["collapsed_tags"]:
                     node_by_tag[parent]["collapsed_tags"].append(tag_name)
             continue
 
         parent = audit.get("parent_equipment")
         parent = CONTROL_LOOP_ASSIGNMENTS.get(tag_name, parent)
-        if parent:
-            parent = member_to_parent.get(parent, parent)
         if parent not in node_by_tag:
             # Fallback: attach sensors to nearest equipment by prefix heuristics.
             parent = _heuristic_parent(tag_name, list(node_by_tag.keys()))
@@ -192,75 +128,336 @@ def _order_nodes_left_to_right(
     )
 
 
-def _ordered_flow_tags(nodes: List[Dict[str, Any]]) -> List[str]:
-    """Return every equipment node in left-to-right process order."""
-    return [node["tag"] for node in _order_nodes_left_to_right(nodes)]
+def _point_on_segment(
+    point: Tuple[float, float],
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+    tolerance: float = 1.0,
+) -> bool:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0:
+        return math.dist(point, start) <= tolerance
+    projection = (
+        (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
+    ) / length_squared
+    if projection < -tolerance or projection > 1 + tolerance:
+        return False
+    closest = (start[0] + projection * dx, start[1] + projection * dy)
+    return math.dist(point, closest) <= tolerance
+
+
+def _project_point(
+    point: Tuple[float, float],
+    start: Tuple[float, float],
+    end: Tuple[float, float],
+) -> Tuple[float, Tuple[float, float]]:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0:
+        return math.dist(point, start), start
+    fraction = max(
+        0.0,
+        min(
+            1.0,
+            ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy)
+            / length_squared,
+        ),
+    )
+    projected = (start[0] + fraction * dx, start[1] + fraction * dy)
+    return math.dist(point, projected), projected
+
+
+def _coordinate_key(point: Tuple[float, float]) -> Tuple[float, float]:
+    return round(point[0], 2), round(point[1], 2)
+
+
+def _source_bbox_for_path(points: List[Tuple[float, float]]) -> List[int]:
+    return [
+        int(round(min(point[0] for point in points))),
+        int(round(min(point[1] for point in points))),
+        int(round(max(point[0] for point in points))),
+        int(round(max(point[1] for point in points))),
+    ]
+
+
+def _build_geometry_edges(
+    nodes: List[Dict[str, Any]],
+    drawing_evidence: Optional[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+    """Trace legend-classified process strokes and retain branch junctions."""
+    segments_by_page: Dict[int, List[Dict[str, Any]]] = {}
+    for segment in (drawing_evidence or {}).get("segments", []):
+        if segment.get("kind") != "process":
+            continue
+        try:
+            page = int(segment["page"])
+            start = tuple(float(value) for value in segment["start"])
+            end = tuple(float(value) for value in segment["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if len(start) != 2 or len(end) != 2 or math.dist(start, end) < 4:
+            continue
+        segments_by_page.setdefault(page, []).append(
+            {"start": start, "end": end}
+        )
+
+    edges: List[Dict[str, Any]] = []
+    junction_nodes: List[Dict[str, Any]] = []
+    unresolved_equipment = 0
+    junction_index = 0
+
+    for page, segments in segments_by_page.items():
+        graph = nx.Graph()
+        endpoints = {
+            _coordinate_key(point)
+            for segment in segments
+            for point in (segment["start"], segment["end"])
+        }
+        split_points: Dict[int, Set[Tuple[float, float]]] = {
+            index: {
+                _coordinate_key(segment["start"]),
+                _coordinate_key(segment["end"]),
+            }
+            for index, segment in enumerate(segments)
+        }
+
+        for index, segment in enumerate(segments):
+            for point in endpoints:
+                if _point_on_segment(point, segment["start"], segment["end"]):
+                    split_points[index].add(point)
+
+        equipment_points: Dict[str, Set[Tuple[float, float]]] = {}
+        for equipment_node in nodes:
+            if int(equipment_node.get("source_page", 0)) != page:
+                continue
+            bbox = equipment_node.get("source_bbox") or [0, 0, 0, 0]
+            if len(bbox) != 4 or bbox == [0, 0, 0, 0]:
+                unresolved_equipment += 1
+                continue
+            symbol_bbox = equipment_node.get("source_symbol_bbox") or []
+            if len(symbol_bbox) != 4:
+                unresolved_equipment += 1
+                continue
+            anchor_bbox = symbol_bbox
+            center = (
+                (float(anchor_bbox[0]) + float(anchor_bbox[2])) / 2,
+                (float(anchor_bbox[1]) + float(anchor_bbox[3])) / 2,
+            )
+            projections = []
+            for index, segment in enumerate(segments):
+                distance, projected = _project_point(
+                    center, segment["start"], segment["end"]
+                )
+                margin = 18.0
+                in_symbol_region = (
+                    float(symbol_bbox[0]) - margin
+                    <= projected[0]
+                    <= float(symbol_bbox[2]) + margin
+                    and float(symbol_bbox[1]) - margin
+                    <= projected[1]
+                    <= float(symbol_bbox[3]) + margin
+                )
+                projections.append(
+                    (distance, index, _coordinate_key(projected), in_symbol_region)
+                )
+            if not projections:
+                unresolved_equipment += 1
+                continue
+            symbol_candidates = {
+                (index, point)
+                for _, index, point, in_symbol_region in projections
+                if in_symbol_region
+            }
+            if not symbol_candidates:
+                unresolved_equipment += 1
+                continue
+            candidates = symbol_candidates
+            points = set()
+            for index, point in candidates:
+                split_points[index].add(point)
+                points.add(point)
+            if points:
+                equipment_points[equipment_node["tag"]] = points
+            else:
+                unresolved_equipment += 1
+
+        point_owners: Dict[Tuple[float, float], List[str]] = {}
+        for tag, points in equipment_points.items():
+            for point in points:
+                point_owners.setdefault(point, []).append(tag)
+
+        def graph_vertex(point: Tuple[float, float]) -> Any:
+            owners = point_owners.get(point, [])
+            if len(owners) == 1:
+                return ("equipment", owners[0])
+            return ("coordinate", point)
+
+        for index, segment in enumerate(segments):
+            points = sorted(
+                split_points[index],
+                key=lambda point: (
+                    point[0] - segment["start"][0]
+                )
+                * (segment["end"][0] - segment["start"][0])
+                + (point[1] - segment["start"][1])
+                * (segment["end"][1] - segment["start"][1]),
+            )
+            for first, second in zip(points, points[1:]):
+                source, target = graph_vertex(first), graph_vertex(second)
+                if source == target:
+                    continue
+                graph.add_edge(source, target, page=page, points=[first, second])
+
+        for tag, points in equipment_points.items():
+            if any(len(point_owners.get(point, [])) > 1 for point in points):
+                unresolved_equipment += 1
+            graph.add_node(("equipment", tag))
+
+        # A coordinate where three or more source pipe strokes meet is kept as
+        # an explicit junction; non-junction geometry is compressed below.
+        meaningful: Set[Any] = {
+            vertex
+            for vertex in graph.nodes
+            if vertex[0] == "equipment"
+            or graph.degree(vertex) != 2
+        }
+        graph_node_by_tag = {node["tag"]: node for node in nodes}
+        output_tag: Dict[Any, str] = {}
+        for vertex in sorted(meaningful, key=lambda item: (item[0], item[1])):
+            if vertex[0] == "equipment":
+                output_tag[vertex] = vertex[1]
+            elif graph.degree(vertex) >= 3:
+                point = vertex[1]
+                junction_index += 1
+                tag = f"JUNCTION-{junction_index}"
+                identifier = f"junction_p{page}_{int(round(point[0]))}_{int(round(point[1]))}"
+                junction_nodes.append(
+                    {
+                        "id": identifier,
+                        "tag": tag,
+                        "type": "junction",
+                        "label": "Process pipe junction",
+                        "source_bbox": [
+                            int(round(point[0])),
+                            int(round(point[1])),
+                            int(round(point[0])),
+                            int(round(point[1])),
+                        ],
+                        "source_page": page,
+                        "collapsed_tags": [],
+                        "duty_standby": False,
+                    }
+                )
+                output_tag[vertex] = tag
+
+        visited: Set[frozenset] = set()
+        for start_vertex in meaningful:
+            start_tag = output_tag.get(start_vertex)
+            if start_tag is None:
+                continue
+            for neighbor in graph.neighbors(start_vertex):
+                path_key = frozenset((start_vertex, neighbor))
+                if path_key in visited:
+                    continue
+                visited.add(path_key)
+                path_points: List[Tuple[float, float]] = []
+                previous, current = start_vertex, neighbor
+                while current not in meaningful:
+                    edge_data = graph.get_edge_data(previous, current) or {}
+                    path_points.extend(edge_data.get("points", []))
+                    next_vertices = [
+                        candidate
+                        for candidate in graph.neighbors(current)
+                        if candidate != previous
+                    ]
+                    if len(next_vertices) != 1:
+                        break
+                    next_vertex = next_vertices[0]
+                    visited.add(frozenset((current, next_vertex)))
+                    previous, current = current, next_vertex
+                edge_data = graph.get_edge_data(previous, current) or {}
+                path_points.extend(edge_data.get("points", []))
+                target_tag = output_tag.get(current)
+                if target_tag is None or start_tag == target_tag:
+                    continue
+                if start_tag not in graph_node_by_tag and not any(
+                    node["tag"] == start_tag for node in junction_nodes
+                ):
+                    continue
+                if target_tag not in graph_node_by_tag and not any(
+                    node["tag"] == target_tag for node in junction_nodes
+                ):
+                    continue
+                pair = tuple(sorted((start_tag, target_tag)))
+                if any(
+                    (edge["source"], edge["target"]) == pair
+                    or (edge["target"], edge["source"]) == pair
+                    for edge in edges
+                ):
+                    continue
+                unique_points = list(dict.fromkeys(path_points))
+                edges.append(
+                    {
+                        "id": f"edge_{pair[0]}_{pair[1]}".replace("-", "").lower(),
+                        "source": pair[0],
+                        "target": pair[1],
+                        "flow_direction": "undirected",
+                        "relation": "process_pipe",
+                        "confidence": 0.85,
+                        "source_page": page,
+                        "source_bbox": _source_bbox_for_path(unique_points)
+                        if unique_points
+                        else [0, 0, 0, 0],
+                    }
+                )
+
+    return edges, junction_nodes, unresolved_equipment
 
 
 def build_process_graph(
     equipment: List[Dict[str, Any]],
     audit_tags: List[Dict[str, Any]],
+    drawing_evidence: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Construct a directed process graph with semantic loop reduction.
-
-    Flow sequence (sample): TK-101 → [P-101A / P-101B] → E-102 → V-102
-
-    Returns nodes, edges, graph_integrity string, and NetworkX edge snapshot.
+    Construct process topology only from legend-classified source pipe geometry.
     """
     nodes = _build_equipment_nodes(equipment, audit_tags)
-    if not nodes:
-        logger.warning("No equipment nodes detected; returning empty graph.")
-        return {
-            "nodes": [],
-            "edges": [],
-            "graph_integrity": "0% — no equipment retained",
-            "edge_count_before_layout": 0,
-            "edge_count_after_layout": 0,
-            "changed_edges": 0,
-        }
-
-    graph = nx.DiGraph()
+    graph = nx.Graph()
     for node in nodes:
         graph.add_node(node["tag"], **node)
 
-    flow = _ordered_flow_tags(nodes)
-    edges: List[Dict[str, Any]] = []
-    for i in range(len(flow) - 1):
-        source, target = flow[i], flow[i + 1]
-        edge_id = f"edge_{source}_{target}".replace("-", "").lower()
-        edge = {
-            "id": edge_id,
-            "source": source,
-            "target": target,
-            "flow_direction": "source_to_target",
-            "relation": "process_pipe",
-            "confidence": 0.94,
-        }
-        graph.add_edge(source, target, **edge)
-        edges.append(edge)
-
-    edge_set_before = {(e["source"], e["target"], e["relation"]) for e in edges}
-
-    # Auto-layout schema: assign left-to-right coordinates without mutating edges.
-    layout_positions = generate_auto_layout(nodes)
-    for node in nodes:
-        pos = layout_positions.get(node["tag"])
-        if pos:
-            node["layout_x"] = pos[0]
-            node["layout_y"] = pos[1]
-
-    edge_set_after = {(e["source"], e["target"], e["relation"]) for e in edges}
-    changed = len(edge_set_before.symmetric_difference(edge_set_after))
-
-    integrity = (
-        "100% Validated (0 changed edges during layout)"
-        if changed == 0
-        else f"{max(0, 100 - changed * 10)}% — {changed} edges changed during layout"
+    edges, junction_nodes, unresolved_equipment = _build_geometry_edges(
+        nodes, drawing_evidence
     )
+    nodes.extend(junction_nodes)
+    for node in junction_nodes:
+        graph.add_node(node["tag"], **node)
+    for edge in edges:
+        graph.add_edge(edge["source"], edge["target"], **edge)
+
+    if not nodes:
+        integrity = "Unverified — no equipment was detected in the PDF."
+    elif not (drawing_evidence or {}).get("classified_process_lines"):
+        integrity = (
+            "Unverified — no legend-classified process-pipe geometry was found."
+        )
+    elif not edges:
+        integrity = (
+            "Unverified — process-pipe geometry was found, but no equipment "
+            "connections could be established."
+        )
+    else:
+        integrity = (
+            f"Partially verified — {len(edges)} source-supported process "
+            "connections; flow direction is unresolved."
+        )
+        if unresolved_equipment:
+            integrity += f" {unresolved_equipment} equipment location(s) unresolved."
 
     logger.info(
-        "Graph built: %d nodes, %d edges, integrity=%s",
+        "Graph built from source geometry: %d equipment/junction nodes, %d edges, status=%s",
         len(nodes),
         len(edges),
         integrity,
@@ -275,6 +472,12 @@ def build_process_graph(
             "type": node["type"],
             "label": node["label"],
             "source_bbox": [int(v) for v in node["source_bbox"]],
+            "source_page": int(node.get("source_page", 0)),
+            "source_symbol_bbox": (
+                [int(v) for v in node["source_symbol_bbox"]]
+                if node.get("source_symbol_bbox")
+                else None
+            ),
             "collapsed_tags": list(node.get("collapsed_tags") or []),
             "duty_standby": bool(node.get("duty_standby", False)),
         }
@@ -284,9 +487,10 @@ def build_process_graph(
         "nodes": serialisable_nodes,
         "edges": edges,
         "graph_integrity": integrity,
-        "edge_count_before_layout": len(edge_set_before),
-        "edge_count_after_layout": len(edge_set_after),
-        "changed_edges": changed,
+        "edge_count_before_layout": len(edges),
+        "edge_count_after_layout": len(edges),
+        "changed_edges": 0,
+        "retained_equipment": sum(1 for node in nodes if node["type"] != "junction"),
         "nx_graph": graph,
     }
 
@@ -316,36 +520,18 @@ def apply_ambiguity_resolution(
     matched_tags: int,
     processing_time_seconds: float = 0.12,
 ) -> Dict[str, Any]:
-    """
-    Recalculate graph integrity after a clarification-queue decision.
-
-    Junction selections may introduce / confirm an edge; crossover keeps topology.
-    """
+    """Keep graph status honest when a user resolves a visual clarification."""
     updated_edges = [dict(e) for e in edges]
-    option_lower = selected_option.lower()
-
-    is_unresolved = any(
-        token in option_lower for token in ("unresolved", "flagged", "not sure")
-    )
-    is_crossover = any(
-        token in option_lower for token in ("crossover", "bridge", "non-connecting", "non connecting")
-    )
-    is_junction = (not is_crossover) and any(
-        token in option_lower for token in ("junction", "4-way", "tee", "they connect")
-    )
-
-    if is_junction:
-        for edge in updated_edges:
-            edge["confidence"] = min(1.0, float(edge.get("confidence", 0.9)) + 0.03)
-        integrity = "100% Validated (junction confirmed)"
-    elif is_unresolved:
-        integrity = "98% — 1 unresolved ambiguity retained"
-        for edge in updated_edges:
-            if edge.get("confidence", 1.0) < 0.9:
-                edge["confidence"] = max(0.5, float(edge["confidence"]) - 0.05)
+    if updated_edges:
+        integrity = (
+            "Partially verified — source-supported topology retained; "
+            "flow direction and unreviewed connections remain unresolved."
+        )
     else:
-        # Crossover / default recommendation — topology unchanged.
-        integrity = "100% Validated (0 changed edges during layout)"
+        integrity = (
+            "Unverified — no source-supported process connections are available; "
+            "the clarification did not validate graph topology."
+        )
 
     kpis = {
         "total_tags": total_tags,

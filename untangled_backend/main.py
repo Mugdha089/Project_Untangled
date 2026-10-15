@@ -13,7 +13,7 @@ from typing import Any, Dict, List
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
-from excel_parser import ExcelParseError, build_fallback_inventory, load_excel_tags
+from excel_parser import ExcelParseError, load_excel_tags
 from graph_engine import apply_ambiguity_resolution, build_process_graph
 from pdf_processor import PdfProcessError, match_excel_inventory, process_pdf
 from schemas import (
@@ -90,9 +90,9 @@ async def process_pid(
     End-to-end pipeline:
 
     1. Parse Excel I/O inventory
-    2. Extract PDF text / equipment evidence
+    2. Extract PDF text, equipment labels, and vector-line evidence
     3. Match tags and build audit report
-    4. Construct NetworkX graph + semantic loop reduction
+    4. Construct NetworkX topology from classified process-line geometry
     5. Return ProcessPidResponse (target < 3 s)
     """
     started = time.perf_counter()
@@ -135,10 +135,11 @@ async def process_pid(
     try:
         inventory = load_excel_tags(excel_bytes, filename=excel_name)
     except ExcelParseError as exc:
-        logger.warning("Excel parse failed (%s); using fallback inventory.", exc)
-        # Soft-fallback keeps the demo path alive; still surface a clear signal.
-        inventory = build_fallback_inventory()
-        inventory["parse_warning"] = str(exc)
+        logger.warning("Excel parse failed: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to parse Excel inventory: {exc}",
+        ) from exc
     except Exception as exc:
         logger.exception("Unexpected Excel error")
         raise HTTPException(
@@ -147,7 +148,10 @@ async def process_pid(
         ) from exc
 
     if not inventory.get("tags"):
-        inventory = build_fallback_inventory()
+        raise HTTPException(
+            status_code=400,
+            detail="Excel workbook contains no usable instrument tags.",
+        )
 
     excel_tags = inventory["tags"]
 
@@ -172,13 +176,17 @@ async def process_pid(
     audit_rows = match_excel_inventory(pdf_result["tags"], excel_tags)
 
     # --- Graph + semantic reduction ------------------------------------------
-    graph_result = build_process_graph(pdf_result["equipment"], audit_rows)
+    graph_result = build_process_graph(
+        pdf_result["equipment"],
+        audit_rows,
+        pdf_result.get("drawing_evidence"),
+    )
 
     elapsed = round(time.perf_counter() - started, 3)
 
     matched = sum(1 for row in audit_rows if row["status"] == "Matched")
     total_tags = len(excel_tags) or len(audit_rows)
-    retained = len(graph_result["nodes"])
+    retained = int(graph_result["retained_equipment"])
 
     kpis = KpiSummary(
         total_tags=total_tags,
@@ -195,6 +203,7 @@ async def process_pid(
             tag_name=row["tag_name"],
             type=row["type"],
             source_bbox=[int(v) for v in row["source_bbox"]],
+            source_page=row.get("source_page"),
             excel_row=int(row["excel_row"]),
             status=row["status"],
             confidence=float(row["confidence"]),
@@ -246,43 +255,28 @@ async def resolve_ambiguity(payload: ResolveAmbiguityRequest) -> ResolveAmbiguit
 
     logger.info("POST /api/resolve-ambiguity id=%s option=%s", resolved_id, option)
 
+    if not _LAST_PIPELINE.get("kpis"):
+        raise HTTPException(
+            status_code=409,
+            detail="Process a PDF before resolving a drawing clarification.",
+        )
+
+    clarification_ids = _LAST_PIPELINE.get("clarification_ids") or set()
+    if resolved_id not in clarification_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Clarification '{resolved_id}' is not available for the latest run.",
+        )
+
     cached_edges: List[Dict[str, Any]] = _LAST_PIPELINE.get("edges") or []
-    if not cached_edges:
-        # Provide a minimal canonical flow so the endpoint remains usable standalone.
-        cached_edges = [
-            {
-                "id": "edge_tk101_p101",
-                "source": "TK-101",
-                "target": "P-101",
-                "flow_direction": "source_to_target",
-                "relation": "process_pipe",
-                "confidence": 0.94,
-            },
-            {
-                "id": "edge_p101_e102",
-                "source": "P-101",
-                "target": "E-102",
-                "flow_direction": "source_to_target",
-                "relation": "process_pipe",
-                "confidence": 0.94,
-            },
-            {
-                "id": "edge_e102_v102",
-                "source": "E-102",
-                "target": "V-102",
-                "flow_direction": "source_to_target",
-                "relation": "process_pipe",
-                "confidence": 0.94,
-            },
-        ]
 
     result = apply_ambiguity_resolution(
         edges=cached_edges,
         item_id=resolved_id,
         selected_option=option,
-        retained_equipment=int(_LAST_PIPELINE.get("retained_equipment") or 4),
-        total_tags=int(_LAST_PIPELINE.get("total_tags") or 8),
-        matched_tags=int(_LAST_PIPELINE.get("matched_tags") or 5),
+        retained_equipment=int(_LAST_PIPELINE.get("retained_equipment", 0)),
+        total_tags=int(_LAST_PIPELINE.get("total_tags", 0)),
+        matched_tags=int(_LAST_PIPELINE.get("matched_tags", 0)),
     )
 
     kpis = KpiSummary(**result["kpis"])
@@ -290,13 +284,14 @@ async def resolve_ambiguity(payload: ResolveAmbiguityRequest) -> ResolveAmbiguit
 
     _LAST_PIPELINE["edges"] = [e.model_dump() for e in edges]
     _LAST_PIPELINE["kpis"] = kpis.model_dump()
-    ids = _LAST_PIPELINE.get("clarification_ids") or set()
-    if isinstance(ids, set):
-        ids.discard(resolved_id)
+    if isinstance(clarification_ids, set) and not any(
+        marker in option.casefold() for marker in ("unresolved", "flagged", "not sure")
+    ):
+        clarification_ids.discard(resolved_id)
 
     message = (
-        f"Ambiguity '{resolved_id}' resolved as '{option}'. "
-        f"Graph integrity: {kpis.graph_integrity}."
+        f"Clarification '{resolved_id}' recorded as '{option}'. "
+        f"{kpis.graph_integrity}"
     )
 
     return ResolveAmbiguityResponse(

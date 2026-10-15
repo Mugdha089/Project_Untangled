@@ -24,7 +24,7 @@ export interface WorkspaceMetrics {
   total: number;
   retained: number;
   equipmentTotal: number;
-  integrity: number;
+  integrity: number | null;
   changedEdges: number;
   seconds: number;
   graphIntegrityLabel: string;
@@ -37,6 +37,8 @@ export interface GraphNodeView {
   tags: string;
   dutyStandby: boolean;
   label: string;
+  sourceBounds?: number[];
+  sourcePage?: number;
 }
 
 export interface GraphEdgeView {
@@ -44,6 +46,9 @@ export interface GraphEdgeView {
   source: EquipmentId;
   target: EquipmentId;
   confidence: number;
+  flowDirection?: string;
+  sourceBounds?: number[];
+  sourcePage?: number;
 }
 
 export interface ClarificationView {
@@ -64,10 +69,10 @@ export const metrics: WorkspaceMetrics = {
   total: 145,
   retained: 12,
   equipmentTotal: 12,
-  integrity: 100,
+  integrity: null,
   changedEdges: 0,
   seconds: 2.84,
-  graphIntegrityLabel: '100% Validated (0 changed edges during layout)',
+  graphIntegrityLabel: 'Sample topology; not validated against a source drawing',
 };
 
 export const auditTags: AuditTag[] = [
@@ -160,7 +165,7 @@ function inferEquipmentForTag(tag: BackendTagAuditItem, nodes: BackendEquipmentN
 
 export function mapKpis(kpis: BackendKpiSummary): WorkspaceMetrics {
   const integrityMatch = kpis.graph_integrity.match(/(\d+)\s*%/);
-  const integrity = integrityMatch ? Number(integrityMatch[1]) : 100;
+  const integrity = integrityMatch ? Number(integrityMatch[1]) : null;
   const changedMatch = kpis.graph_integrity.match(/(\d+)\s+changed/i);
   return {
     matched: kpis.matched_tags,
@@ -199,6 +204,8 @@ export function mapGraphNodes(nodes: BackendEquipmentNode[]): GraphNodeView[] {
     tags: node.collapsed_tags.length ? node.collapsed_tags.join(' · ') : '—',
     dutyStandby: node.duty_standby,
     label: node.label,
+    sourceBounds: node.source_symbol_bbox ?? node.source_bbox,
+    sourcePage: node.source_page,
   }));
 }
 
@@ -208,6 +215,9 @@ export function mapGraphEdges(edges: BackendProcessEdge[]): GraphEdgeView[] {
     source: edge.source,
     target: edge.target,
     confidence: edge.confidence,
+    flowDirection: edge.flow_direction,
+    sourceBounds: edge.source_bbox ?? undefined,
+    sourcePage: edge.source_page ?? undefined,
   }));
 }
 

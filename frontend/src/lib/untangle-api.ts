@@ -19,9 +19,11 @@ export interface BackendKpiSummary {
 export interface BackendEquipmentNode {
   id: string;
   tag: string;
-  type: 'tank' | 'pump' | 'mixer' | 'exchanger' | 'vessel' | 'valve';
+  type: 'tank' | 'pump' | 'mixer' | 'exchanger' | 'vessel' | 'valve' | 'filter' | 'junction';
   label: string;
   source_bbox: number[];
+  source_page: number;
+  source_symbol_bbox?: number[] | null;
   collapsed_tags: string[];
   duty_standby: boolean;
 }
@@ -33,12 +35,15 @@ export interface BackendProcessEdge {
   flow_direction: string;
   relation: string;
   confidence: number;
+  source_page?: number | null;
+  source_bbox?: number[] | null;
 }
 
 export interface BackendTagAuditItem {
   tag_name: string;
   type: string;
   source_bbox: number[];
+  source_page?: number | null;
   excel_row: number;
   status: BackendTagStatus;
   confidence: number;

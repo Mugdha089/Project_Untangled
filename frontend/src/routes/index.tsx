@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowLeftRight,
@@ -15,7 +15,6 @@ import {
   Download,
   FileText,
   GitBranch,
-  GitCommitHorizontal,
   Layers,
   Link2,
   Loader2,
@@ -52,6 +51,7 @@ import {
   clarifications as demoClarifications,
   defaultGraphEdges,
   defaultGraphNodes,
+  mapGraphEdges,
   mapProcessResponse,
   metrics as demoMetrics,
   resolutionToOption,
@@ -113,6 +113,9 @@ function Index() {
   const [boxes, setBoxes] = useState(true);
   const [zoom, setZoom] = useState(100);
   const [view, setView] = useState("pfd");
+  const [pfdZoom, setPfdZoom] = useState<"auto" | "fit" | number>("auto");
+  const [pfdFitScale, setPfdFitScale] = useState(1);
+  const [pfdAutoScale, setPfdAutoScale] = useState(1);
   const [auditOpen, setAuditOpen] = useState(true);
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -141,6 +144,17 @@ function Index() {
   const [sourcePdfUrl, setSourcePdfUrl] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
   const [authReady, setAuthReady] = useState(false);
+
+  const updatePfdScales = useCallback((fitScale: number, autoScale: number) => {
+    setPfdFitScale(fitScale);
+    setPfdAutoScale(autoScale);
+  }, []);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timeout = window.setTimeout(() => setNotice(""), 4500);
+    return () => window.clearTimeout(timeout);
+  }, [notice]);
 
   useEffect(() => {
     try {
@@ -237,14 +251,13 @@ function Index() {
     if (error instanceof UntangleApiError) {
       toast.error(error.unreachable ? "Server unreachable" : "Request failed", {
         description: error.message,
+        id: "untangle-api-error",
       });
-      notify(error.message);
       return;
     }
     const message =
       error instanceof Error ? error.message : "Unexpected error talking to the backend.";
-    toast.error("Request failed", { description: message });
-    notify(message);
+    toast.error("Request failed", { description: message, id: "untangle-api-error" });
   };
 
   const handleProcess = async (pdf: File, excel: File) => {
@@ -263,6 +276,7 @@ function Index() {
       setExcelName(excel.name);
       setResolvedTags([]);
       setLocated(false);
+      setPfdZoom("auto");
       setLiveConnected(true);
       setQueueIndex(0);
       setResolution("bridge");
@@ -271,10 +285,8 @@ function Index() {
       );
       toast.success("P&ID processed", {
         description: `${mapped.metrics.matched}/${mapped.metrics.total} tags matched in ${mapped.metrics.seconds}s`,
+        id: "untangle-process",
       });
-      notify(
-        `Processed ${pdf.name} in ${mapped.metrics.seconds}s. Graph integrity: ${mapped.metrics.graphIntegrityLabel}.`,
-      );
       if (mapped.clarifications.length) setQueueOpen(true);
     } catch (error) {
       showApiError(error);
@@ -306,14 +318,8 @@ function Index() {
     try {
       if (liveConnected) {
         const result = await resolveAmbiguity(current.id, option);
-        setGraphEdges((prev) =>
-          result.edges.map((edge) => ({
-            id: edge.id,
-            source: edge.source,
-            target: edge.target,
-            confidence: edge.confidence,
-          })),
-        );
+        const integrityMatch = result.kpis.graph_integrity.match(/(\d+)\s*%/);
+        setGraphEdges(mapGraphEdges(result.edges));
         setWorkspaceMetrics((prev) => ({
           ...prev,
           matched: result.kpis.matched_tags,
@@ -322,16 +328,18 @@ function Index() {
           equipmentTotal: result.kpis.retained_equipment,
           seconds: Number(result.kpis.processing_time_seconds.toFixed(2)),
           graphIntegrityLabel: result.kpis.graph_integrity,
-          integrity: Number(result.kpis.graph_integrity.match(/(\d+)\s*%/)?.[1] ?? prev.integrity),
+          integrity: integrityMatch ? Number(integrityMatch[1]) : null,
           changedEdges: Number(result.kpis.graph_integrity.match(/(\d+)\s+changed/i)?.[1] ?? 0),
         }));
-        toast.success("Graph re-validated", { description: result.message });
-        notify(result.message);
+        toast.success("Clarification recorded", {
+          description: result.message,
+          id: "untangle-clarification",
+        });
       } else {
         notify(
           resolution === "unresolved"
             ? "Intersection kept flagged for review."
-            : `Intersection #${String(current.id).padStart(2, "0")} resolved. Graph re-validated: 100% integrity.`,
+            : `Intersection #${String(current.id).padStart(2, "0")} resolved. Source topology remains unverified.`,
         );
       }
 
@@ -357,10 +365,25 @@ function Index() {
       await exportDiagram(format);
       notify(`${format} diagram exported.`);
     } catch (error) {
-      notify(error instanceof Error ? error.message : "Export failed. Please try again.");
+      toast.error("Diagram export failed", {
+        description: error instanceof Error ? error.message : "Export failed. Please try again.",
+        id: "untangle-export-error",
+      });
     } finally {
       setExporting(false);
     }
+  };
+
+  const changePfdZoom = (direction: -1 | 1) => {
+    setPfdZoom((current) => {
+      const scale =
+        current === "auto"
+          ? pfdAutoScale
+          : current === "fit"
+            ? pfdFitScale
+            : current / 100;
+      return Math.max(30, Math.min(200, Math.round(scale * 100) + direction * 10));
+    });
   };
 
   const auditTable = (compact = false) => (
@@ -650,17 +673,19 @@ function Index() {
               <ShieldCheck size={16} />
             </div>
             <div className="metric-value">
-              {workspaceMetrics.integrity}
-              <span className="metric-denominator percent">%</span>
-              <span className="metric-qualifier success-text">Validated</span>
-            </div>
-            <div className="integrity-line">
-              <GitCommitHorizontal size={15} />
-              <b>{workspaceMetrics.changedEdges}</b> changed edges during layout
+              {workspaceMetrics.integrity ?? '—'}
+              {workspaceMetrics.integrity !== null && (
+                <span className="metric-denominator percent">%</span>
+              )}
+              <span className="metric-qualifier">
+                {workspaceMetrics.integrity === null ? 'Not verified' : 'Reported'}
+              </span>
             </div>
             <div className="metric-foot">
               <span>
-                <span className="status-dot matched" />
+                <span
+                  className={`status-dot ${workspaceMetrics.integrity === null ? 'pending' : 'matched'}`}
+                />
                 {workspaceMetrics.graphIntegrityLabel}
               </span>
             </div>
@@ -847,9 +872,47 @@ function Index() {
                 <h3>Simplified process sketch</h3>
               </div>
               <span className="pfd-badge">PFD</span>
-              <span className="validated-badge">
-                <CheckCircle2 size={12} />
-                Graph validated
+              <div className="pfd-zoom-controls" aria-label="PFD zoom controls">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Zoom PFD out"
+                  title="Zoom out"
+                  onClick={() => changePfdZoom(-1)}
+                  disabled={pfdZoom !== "auto" && pfdZoom !== "fit" && pfdZoom <= 30}
+                >
+                  <Minus />
+                </Button>
+                <span>
+                  {pfdZoom === "auto"
+                    ? `${Math.round(pfdAutoScale * 100)}%`
+                    : pfdZoom === "fit"
+                      ? `${Math.round(pfdFitScale * 100)}%`
+                      : `${pfdZoom}%`}
+                </span>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Zoom PFD in"
+                  title="Zoom in"
+                  onClick={() => changePfdZoom(1)}
+                  disabled={pfdZoom !== "auto" && pfdZoom !== "fit" && pfdZoom >= 200}
+                >
+                  <Plus />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  aria-label="Fit PFD to view"
+                  title="Fit to view"
+                  onClick={() => setPfdZoom("fit")}
+                >
+                  Fit
+                </Button>
+              </div>
+              <span className={`validated-badge ${workspaceMetrics.integrity === null ? "unverified-badge" : ""}`}>
+                <ShieldCheck size={12} />
+                {workspaceMetrics.integrity === null ? "Topology unverified" : "Integrity reported"}
               </span>
             </div>
             <div className="view-tabs" role="tablist" aria-label="Process view">
@@ -895,6 +958,8 @@ function Index() {
                   topology={view === "topology"}
                   nodes={graphNodes}
                   edges={graphEdges}
+                  zoom={pfdZoom}
+                  onLayoutScaleChange={updatePfdScales}
                 />
               )}
               <Button
@@ -915,9 +980,15 @@ function Index() {
                 <span className="legend-square collapsed-legend" />
                 Collapsed control loops
               </span>
-              <span className="success-text">
-                <CheckCircle2 size={12} />
-                {workspaceMetrics.changedEdges} broken edges
+              <span className={workspaceMetrics.integrity === null ? "unverified-text" : "success-text"}>
+                {workspaceMetrics.integrity === null ? (
+                  <TriangleAlert size={12} />
+                ) : (
+                  <CheckCircle2 size={12} />
+                )}
+                {workspaceMetrics.integrity === null
+                  ? "Edge validation unavailable"
+                  : `${workspaceMetrics.changedEdges} edge changes reported`}
               </span>
             </div>
           </div>
@@ -1154,7 +1225,10 @@ function Index() {
           ) : (
             <div className="queue-empty">
               <CheckCircle2 size={40} />
-              <h3>All clear. Graph validated.</h3>
+              <h3>No clarification items remain.</h3>
+              <p>
+                Topology status: {workspaceMetrics.integrity === null ? "unverified" : "integrity reported"}.
+              </p>
               <Button onClick={() => setQueueOpen(false)}>Return to workspace</Button>
             </div>
           )}
