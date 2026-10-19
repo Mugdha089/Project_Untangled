@@ -1,0 +1,4 @@
+/untangled_backend/data/
+/untangled_backend/.env
+/untangled_backend/.env.*
+!/untangled_backend/.env.example

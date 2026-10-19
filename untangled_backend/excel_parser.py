@@ -21,6 +21,7 @@ TAG_HEADER_CANDIDATES: Tuple[str, ...] = (
     "tag no.",
     "instrument",
     "loop tag",
+    "equipment tag",
 )
 
 TYPE_HEADER_CANDIDATES: Tuple[str, ...] = (
@@ -198,6 +199,50 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
             }
         )
 
+    additional_rows = 0
+    parsed_equipment_sheets: List[str] = []
+    for equipment_sheet in workbook.sheet_names:
+        if equipment_sheet == sheet_name or "major equipment" not in _normalize_header(equipment_sheet):
+            continue
+        equipment_df = pd.read_excel(workbook, sheet_name=equipment_sheet, dtype=object)
+        if equipment_df.empty:
+            continue
+        additional_rows += len(equipment_df)
+        equipment_columns = [str(column) for column in equipment_df.columns.tolist()]
+        equipment_tag_column = _find_column(equipment_columns, TAG_HEADER_CANDIDATES)
+        if equipment_tag_column is None:
+            continue
+        equipment_type_column = _find_column(equipment_columns, TYPE_HEADER_CANDIDATES)
+        parsed_equipment_sheets.append(equipment_sheet)
+        for idx, row in equipment_df.iterrows():
+            excel_row = int(idx) + 2
+            raw_tag = row.get(equipment_tag_column)
+            tag = _normalize_tag(raw_tag)
+            if not tag:
+                empty_rows.append(excel_row)
+                continue
+            raw_type = row.get(equipment_type_column) if equipment_type_column else None
+            instrument_type = (
+                str(raw_type).strip()
+                if raw_type is not None and not (isinstance(raw_type, float) and pd.isna(raw_type))
+                else _infer_tag_type(tag)
+            )
+            duplicate = tag in seen
+            if duplicate:
+                duplicates.append(tag)
+            else:
+                seen[tag] = excel_row
+            tags.append(
+                {
+                    "tag_name": tag,
+                    "original_tag": str(raw_tag).strip() if raw_tag is not None else tag,
+                    "type": instrument_type,
+                    "excel_row": excel_row,
+                    "excel_sheet": equipment_sheet,
+                    "status_note": "duplicate" if duplicate else "unique",
+                }
+            )
+
     logger.info(
         "Parsed %d tags (%d duplicates, %d empty rows) from '%s'",
         len(tags),
@@ -212,8 +257,9 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
         "type_column": type_column,
         "duplicates": duplicates,
         "empty_rows": empty_rows,
-        "total_rows": len(df),
+        "total_rows": len(df) + additional_rows,
         "sheet_name": sheet_name,
+        "sheet_names": [sheet_name, *parsed_equipment_sheets],
     }
 
 

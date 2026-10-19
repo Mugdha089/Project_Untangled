@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { EquipmentId, GraphEdgeView, GraphNodeView } from '@/lib/untangle-data';
+import type { AuditTag, EquipmentId, GraphEdgeView, GraphNodeView } from '@/lib/untangle-data';
 import { layoutPfd } from '@/lib/pfd-layout';
 
 type PfdZoom = 'auto' | 'fit' | number;
@@ -8,10 +8,11 @@ interface DiagramProps {
   selected: EquipmentId | null;
   onSelect: (id: EquipmentId) => void;
   onHover: (id: EquipmentId | null) => void;
+  sourceTags?: AuditTag[];
 }
 
 export function EquipmentSymbol({ kind, x = 0, y = 0 }: { kind: string; x?: number; y?: number }) {
-  const symbol = kind === 'tank' || kind === 'pump' || kind === 'mixer' || kind === 'exchanger' || kind === 'vessel' || kind === 'valve' || kind === 'filter' || kind === 'junction' ? kind : 'pump';
+  const symbol = kind === 'tank' || kind === 'pump' || kind === 'mixer' || kind === 'exchanger' || kind === 'vessel' || kind === 'valve' || kind === 'filter' || kind === 'junction' ? kind : 'generic';
   return (
     <g transform={`translate(${x},${y})`} className="equipment-symbol" fill="none" stroke="currentColor" strokeWidth="1.8">
       {symbol === 'tank' && (
@@ -52,6 +53,7 @@ export function EquipmentSymbol({ kind, x = 0, y = 0 }: { kind: string; x?: numb
         </>
       )}
       {symbol === 'junction' && <circle r="5" fill="currentColor" />}
+      {symbol === 'generic' && <rect x="-22" y="-22" width="44" height="44" rx="4" />}
     </g>
   );
 }
@@ -60,6 +62,7 @@ export function ProcessDiagram({
   selected,
   onSelect,
   onHover,
+  sourceTags = [],
   topology = false,
   nodes,
   edges,
@@ -73,6 +76,14 @@ export function ProcessDiagram({
   onLayoutScaleChange?: (fitScale: number, autoScale: number) => void;
 }) {
   const layout = layoutPfd(nodes, edges);
+  const visibleSourceTags = sourceTags.filter(tag =>
+    (tag.status === 'matched' || tag.status === 'ambiguous' || tag.status === 'pending')
+    && tag.bounds !== 'Not Detected',
+  );
+  const tagColumns = Math.max(1, Math.floor((layout.width - 60) / 96));
+  const tagRows = Math.ceil(visibleSourceTags.length / tagColumns);
+  const sourceTagBandHeight = visibleSourceTags.length ? 35 + tagRows * 22 : 0;
+  const viewHeight = layout.height + sourceTagBandHeight;
   const byId = new Map(layout.nodes.map(node => [node.id, node]));
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [canvasSize, setCanvasSize] = useState({ width: 640, height: 371 });
@@ -85,7 +96,7 @@ export function ProcessDiagram({
     observer.observe(canvas);
     return () => observer.disconnect();
   }, []);
-  const fitScale = Math.min(1, canvasSize.width / layout.width, canvasSize.height / layout.height);
+  const fitScale = Math.min(1, canvasSize.width / layout.width, canvasSize.height / viewHeight);
   const autoScale = layout.width > 900 ? 1 : fitScale;
   useEffect(() => {
     onLayoutScaleChange?.(fitScale, autoScale);
@@ -96,7 +107,7 @@ export function ProcessDiagram({
       ? fitScale
       : zoom / 100;
   const diagramWidth = layout.width * scale;
-  const diagramHeight = layout.height * scale;
+  const diagramHeight = viewHeight * scale;
   const equipmentCount = layout.nodes.filter(node => node.kind !== 'junction').length;
 
   return (
@@ -104,7 +115,7 @@ export function ProcessDiagram({
       <svg
         ref={svgRef}
         id="process-diagram"
-        viewBox={`0 0 ${layout.width} ${layout.height}`}
+        viewBox={`0 0 ${layout.width} ${viewHeight}`}
         className="process-svg"
         role="img"
         aria-label={topology ? 'Full process topology graph' : 'Simplified process flow diagram'}
@@ -130,10 +141,22 @@ export function ProcessDiagram({
       {layout.routes.map(({ edge, path, recycle }) => {
         return (
           <g key={edge.id}>
+            <title>
+              {edge.evidenceStatus === 'user_confirmed_crossing'
+                ? 'Connection confirmed by reviewer at a source crossing'
+                : edge.evidenceStatus === 'user_confirmed_nozzle'
+                  ? 'Equipment connection confirmed by reviewer'
+                  : edge.evidenceStatus === 'provisional_nozzle_alignment'
+                    ? 'Provisional equipment connection: aligned nozzle endpoint is awaiting review'
+                    : 'Connection extracted from source process geometry'}
+            </title>
             <path
               d={path}
               className={`flow-path${recycle ? ' recycle-path' : ''}`}
-              markerEnd={edge.flowDirection === 'undirected' ? undefined : 'url(#flow-arrow)'}
+              strokeDasharray={edge.evidenceStatus === 'provisional_nozzle_alignment' ? '6 4' : undefined}
+              strokeWidth={edge.evidenceStatus?.startsWith('user_confirmed_') ? 2.5 : undefined}
+              markerEnd={edge.flowDirection === 'source_to_target' ? 'url(#flow-arrow)' : undefined}
+              markerStart={edge.flowDirection === 'target_to_source' ? 'url(#flow-arrow)' : undefined}
             />
           </g>
         );
@@ -163,31 +186,23 @@ export function ProcessDiagram({
             rx="7"
             className="node-hit"
           />
-          {node.dutyStandby ? (
-            <g transform={`translate(${node.x},${node.y})`}>
-              <g transform="translate(-20,0) scale(.65)">
-                <EquipmentSymbol kind="pump" />
-              </g>
-              <g transform="translate(20,0) scale(.65)">
-                <EquipmentSymbol kind="pump" />
-              </g>
-            </g>
-          ) : (
-            <EquipmentSymbol kind={node.kind} x={node.x} y={node.y} />
-          )}
+          <EquipmentSymbol kind={node.kind} x={node.x} y={node.y} />
           <text x={node.x} y={node.y - 58} textAnchor="middle" className="diagram-node-label">
-            {node.dutyStandby ? `${node.id}A / ${node.id}B` : node.id}
+            {node.id}
           </text>
           {node.kind !== 'junction' && (
             <>
               <text x={node.x} y={node.y + 44} textAnchor="middle" className="diagram-node-name">
                 {node.name}
               </text>
-              <rect x={node.x - 60} y={node.y + 59} width="120" height="23" rx="4" className="metadata-bg" />
-              <text x={node.x} y={node.y + 74} textAnchor="middle" className="metadata-text">
-                {node.tags}
-              </text>
-              <circle cx={node.x + 32} cy={node.y - 41} r="3" className="verified-dot" />
+              {node.tags !== '—' && node.tags.split(' · ').filter(Boolean).map((tag, index) => (
+                <g key={`${node.id}-${tag}`}>
+                  <rect x={node.x - 60} y={node.y + 59 + index * 14} width="120" height="13" rx="3" className="metadata-bg" />
+                  <text x={node.x} y={node.y + 69 + index * 14} textAnchor="middle" className="metadata-text">
+                    {tag}
+                  </text>
+                </g>
+              ))}
             </>
           )}
           {topology && (
@@ -197,15 +212,36 @@ export function ProcessDiagram({
           )}
         </g>
       ))}
+      {visibleSourceTags.length > 0 && (
+        <g className="source-tag-evidence" aria-label="Source-detected tags not assigned to equipment">
+          <text x="30" y={layout.height + 18} className="diagram-small">
+            SOURCE-DETECTED TAGS · NO EQUIPMENT ASSOCIATION INFERRED
+          </text>
+          {visibleSourceTags.map((tag, index) => {
+            const column = index % tagColumns;
+            const row = Math.floor(index / tagColumns);
+            const x = 30 + column * 96;
+            const y = layout.height + 25 + row * 22;
+            return (
+              <g key={`source-tag-${tag.tag}`} aria-label={`${tag.tag}, ${tag.status}`}>
+                <circle cx={x + 5} cy={y + 8} r="3" className={tag.status === 'matched' ? 'source-tag-matched' : 'source-tag-review'} />
+                <text x={x + 12} y={y + 11} className="metadata-text">{tag.tag}</text>
+              </g>
+            );
+          })}
+        </g>
+      )}
       {!topology && (
         <>
           <text x="25" y={layout.height - 24} className="diagram-small">
             {equipmentCount} EQUIPMENT ITEMS
           </text>
           <text x={layout.width - 25} y={layout.height - 24} textAnchor="end" className="diagram-small">
-            {edges.some(edge => edge.flowDirection === 'undirected')
-              ? 'FLOW DIRECTION UNRESOLVED'
-              : 'FLOW DIRECTION →'}
+            {edges.length === 0
+              ? 'NO SOURCE-SUPPORTED FLOW EDGES'
+              : edges.some(edge => edge.flowDirection === 'source_to_target' || edge.flowDirection === 'target_to_source')
+                ? 'FLOW DIRECTION SHOWN FROM SOURCE EVIDENCE'
+                : 'FLOW DIRECTION UNRESOLVED'}
           </text>
         </>
       )}

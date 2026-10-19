@@ -20,7 +20,7 @@ export interface PfdLayout {
 }
 
 const COLUMN_GAP = 142;
-const ROW_GAP = 164;
+const BASE_ROW_GAP = 164;
 const MARGIN_X = 72;
 const MARGIN_Y = 86;
 const SYMBOL_RADIUS = 34;
@@ -133,14 +133,18 @@ function makeNodePositions(
     : orientWithoutSourceCoordinates(nodes, edges);
   const rowsByColumn = columns.map((column) => makeRows(column));
   const maxRows = Math.max(1, ...rowsByColumn.map((rows) => rows.length));
+  const maxTagRows = Math.max(0, ...nodes.map((node) =>
+    node.tags === "—" ? 0 : node.tags.split(" · ").filter(Boolean).length,
+  ));
+  const rowGap = Math.max(BASE_ROW_GAP, 150 + Math.max(0, maxTagRows - 1) * 14);
   const width = Math.max(640, MARGIN_X * 2 + Math.max(0, columns.length - 1) * COLUMN_GAP);
-  const height = Math.max(360, MARGIN_Y * 2 + Math.max(0, maxRows - 1) * ROW_GAP + 130);
+  const height = Math.max(360, MARGIN_Y * 2 + Math.max(0, maxRows - 1) * rowGap + 130);
   const positioned: PfdPositionedNode[] = [];
 
   rowsByColumn.forEach((rows, columnIndex) => {
     const columnX = MARGIN_X + columnIndex * COLUMN_GAP;
     rows.forEach((row, rowIndex) => {
-      const rowOffset = (rowIndex - (rows.length - 1) / 2) * ROW_GAP;
+      const rowOffset = (rowIndex - (rows.length - 1) / 2) * rowGap;
       row.forEach((node) => {
         positioned.push({
           ...node,

@@ -16,6 +16,9 @@ Each numbered case includes:
 5. **05_dense_recycle** — parallel pumps, heater, separator, outlet valve, recycle return, instruments, and control signal.
 6. **06_scanned_image_only** — image-only PDF based on the branch/merge diagram; no selectable/searchable embedded text. Tests OCR fallback.
 7. **07_missing_ambiguous_tags** — known tags plus deliberately absent near-match and unrelated tags in Excel. Missing tags must remain missing and must not be auto-corrected to visible tags.
+8. **08_ambiguous_crossing** — two independently connected process routes cross geometrically. The workbook records the expected equipment/tags and both allowed interpretations; a live run must show a crop and preserve separate routes until reviewed.
+9. **09_bypass_recycle** — an exchanger bypass and a return loop from the downstream vessel to pump suction, with instrument tags and one absent inventory tag.
+10. **10_dense_shared_headers** — parallel pumps, two treatment branches, shared suction/discharge headers, and dense instrumentation with one absent inventory tag.
 
 ## Ground truth / acceptance notes
 - Equipment and instrument tags are recorded in each workbook.
@@ -24,6 +27,9 @@ Each numbered case includes:
 - `utility` is a separate utility connection, not a process-flow edge.
 - `instrument-signal` is a signal relationship, not a process-flow edge.
 - For Case 7, `LT-609`, `FT-601A`, `PT-699`, and equipment `E-609` are deliberately absent. They must not be marked as confirmed matches.
+- Case 8 has no flow arrows. Its two visible routes are `P-801`→`V-801` and `E-801`→`TK-801`; those paths remain separate for the crossover choice and become connected through a source-local junction only after the user selects the junction interpretation.
+- Cases 9 and 10 have ground-truth equipment, tag, and high-level topology rows in their workbooks. The listed `LT-999` and `LT-1099` tags are intentionally absent and must remain missing.
+- Synthetic fixture ground truth describes expected behavior. Regression results must be reported separately; the workbook is not evidence that the pipeline actually met the expectation.
 - Case 6 should have zero embedded text characters before OCR; the app should identify it as image-only and attempt OCR or clearly report OCR unavailability.
 
 ## Important limitations
@@ -43,3 +49,12 @@ For each case, record:
 10. Browser Console and Network errors
 
 Do not treat successful API responses or a high graph-integrity percentage as evidence of correct topology unless the graph is checked against source evidence.
+
+## Current extraction behavior and root causes
+
+- Equipment labels are detected from embedded text tags. Prefix-only classification covers a limited set; an unfamiliar tag is promoted to equipment only when a nearby explicit equipment descriptor supports its type. Untagged vector symbols are not classified as equipment.
+- Process-line extraction accepts legend-classified PyMuPDF line items (`l`). Other path commands and image-only strokes are not treated as process pipes.
+- The prior point-on-segment check compared a distance tolerance directly to a normalized segment fraction. On a long line that allowed points far beyond the endpoint to count as lying on the line. The graph also kept nearby line endpoints as separate vertices. The check now converts the tolerance to a fraction of segment length, and endpoints snap only within `clamp(0.001 × page diagonal, 0.5 pt, 2 pt)`; a cluster's every pair must remain within tolerance to avoid transitive over-joining.
+- Graph edges include IDs of supporting vector line items. The previous fixed edge confidence of `0.85` was uncalibrated and is no longer emitted. Edges created through a selected junction are marked `user_confirmed_crossing`.
+- A document with embedded title text but no detectable tag or equipment labels is now rejected with an OCR/image-extraction limitation instead of returning an apparently processed empty audit.
+- These are code-level root causes and targeted regressions, not measured fixture accuracy. Run `python -m pytest -q test_pipeline_regressions.py` from `untangled_backend` before making accuracy claims.

@@ -1,0 +1,542 @@
+%PDF-1.3
+%ºß¬à
+3 0 obj
+<</Type /Page
+/Parent 1 0 R
+/Resources 2 0 R
+/MediaBox [0 0 800. 600.]
+/Contents 4 0 R
+>>
+endobj
+4 0 obj
+<<
+/Length 4593
+>>
+stream
+0.200025 w
+0 G
+BT
+/F2 17 Tf
+19.5499999999999972 TL
+0 g
+28. 576. Td
+(UNTANGLE SYNTHETIC P&ID TEST FIXTURE) Tj
+ET
+BT
+/F1 9 Tf
+10.3499999999999996 TL
+0 g
+28. 555. Td
+(For software regression testing only - not for plant operation or construction) Tj
+ET
+0.1 0.33 0.41 RG
+1.5 w
+28. 533. m
+53. 533. l
+S
+BT
+/F1 9 Tf
+10.3499999999999996 TL
+0 g
+59. 530. Td
+(PROCESS PIPE) Tj
+ET
+0.67 0.69 0.71 RG
+0.8 w
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+44. 323. m
+66. 323. l
+69.8659932488155562 323. 73. 319.8659932488155277 73. 316. c
+73. 284. l
+73. 280.1340067511844723 69.1340067511844438 277. 66. 277. c
+44. 277. l
+40.1340067511844438 277. 37. 280.8659932488155277 37. 284. c
+37. 316. l
+37. 319.8659932488155277 40.8659932488155562 323. 44. 323. c
+h
+B
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+37.6300000000000026 264. Td
+(TK-1001) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+204. 395. m
+204. 402.7319864976311123 197.7319864976311123 409. 190. 409. c
+182.2680135023688877 409. 176. 402.7319864976311123 176. 395. c
+176. 387.2680135023688877 182.2680135023688877 381. 190. 381. c
+197.7319864976311123 381. 204. 387.2680135023688877 204. 395. c
+B
+183. 395. m
+197. 402. l
+S
+197. 402. m
+197. 388. l
+S
+197. 388. m
+183. 395. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+172.4050000000000011 359. Td
+(P-1001A) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+204. 205. m
+204. 212.7319864976311123 197.7319864976311123 219. 190. 219. c
+182.2680135023688877 219. 176. 212.7319864976311123 176. 205. c
+176. 197.2680135023688877 182.2680135023688877 191. 190. 191. c
+197.7319864976311123 191. 204. 197.2680135023688877 204. 205. c
+B
+183. 205. m
+197. 212. l
+S
+197. 212. m
+197. 198. l
+S
+197. 198. m
+183. 205. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+172.4050000000000011 169. Td
+(P-1001B) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+400. 454. 40. -28. re
+B
+406. 450. m
+434. 430. l
+S
+406. 430. m
+434. 450. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+405.6449999999999818 404. Td
+(E-1001) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+404. 179. 32. -38. re
+B
+408. 148. m
+432. 172. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+405.8700000000000045 124. Td
+(F-1001) Tj
+ET
+BT
+/F2 7 Tf
+8.0499999999999989 TL
+0.078 0.141 0.176 rg
+411.4599999999999795 113. Td
+(Filter) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+704. 323. m
+726. 323. l
+729.8659932488155846 323. 733. 319.8659932488155277 733. 316. c
+733. 284. l
+733. 280.1340067511844723 729.1340067511844154 277. 726. 277. c
+704. 277. l
+700.1340067511844154 277. 697. 280.8659932488155277 697. 284. c
+697. 316. l
+697. 319.8659932488155277 700.8659932488155846 323. 704. 323. c
+h
+B
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+700.6449999999999818 264. Td
+(V-1001) Tj
+ET
+0.1 0.33 0.41 RG
+1.5 w
+73. 300. m
+112. 300. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+112. 395. m
+112. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+112. 395. m
+172. 395. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+112. 205. m
+172. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+208. 395. m
+330. 395. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+208. 205. m
+330. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+330. 395. m
+330. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+330. 395. m
+400. 440. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+330. 205. m
+400. 160. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+440. 440. m
+565. 395. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+440. 160. m
+565. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+565. 395. m
+565. 205. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+565. 300. m
+697. 300. l
+S
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+130. 430. Td
+(PT-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+245. 415. Td
+(FT-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+130. 380. Td
+(PI-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+130. 235. Td
+(PT-1002) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+245. 185. Td
+(FT-1002) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+445. 470. Td
+(TT-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+445. 134. Td
+(TT-1002) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+700. 330. Td
+(LT-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+495. 415. Td
+(FC-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+520. 385. Td
+(FV-1001) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+610. 333. Td
+(PT-1099) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+210. 65. Td
+(Parallel pump and treatment branches use shared suction and discharge headers) Tj
+ET
+endstream
+endobj
+1 0 obj
+<</Type /Pages
+/Kids [3 0 R ]
+/Count 1
+>>
+endobj
+5 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+6 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+7 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Oblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+8 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-BoldOblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+9 0 obj
+<<
+/Type /Font
+/BaseFont /Courier
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+10 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+11 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-Oblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+12 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-BoldOblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+13 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Roman
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+14 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+15 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Italic
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+16 0 obj
+<<
+/Type /Font
+/BaseFont /Times-BoldItalic
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+17 0 obj
+<<
+/Type /Font
+/BaseFont /ZapfDingbats
+/Subtype /Type1
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+18 0 obj
+<<
+/Type /Font
+/BaseFont /Symbol
+/Subtype /Type1
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+2 0 obj
+<<
+/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]
+/Font <<
+/F1 5 0 R
+/F2 6 0 R
+/F3 7 0 R
+/F4 8 0 R
+/F5 9 0 R
+/F6 10 0 R
+/F7 11 0 R
+/F8 12 0 R
+/F9 13 0 R
+/F10 14 0 R
+/F11 15 0 R
+/F12 16 0 R
+/F13 17 0 R
+/F14 18 0 R
+>>
+/XObject <<
+>>
+>>
+endobj
+19 0 obj
+<<
+/Producer (jsPDF 4.2.1)
+/CreationDate (D:20261018140234+05'30')
+>>
+endobj
+20 0 obj
+<<
+/Type /Catalog
+/Pages 1 0 R
+/OpenAction [3 0 R /FitH null]
+/PageLayout /OneColumn
+>>
+endobj
+xref
+0 21
+0000000000 65535 f 
+0000004765 00000 n 
+0000006582 00000 n 
+0000000015 00000 n 
+0000000120 00000 n 
+0000004822 00000 n 
+0000004947 00000 n 
+0000005077 00000 n 
+0000005210 00000 n 
+0000005347 00000 n 
+0000005470 00000 n 
+0000005599 00000 n 
+0000005731 00000 n 
+0000005867 00000 n 
+0000005995 00000 n 
+0000006122 00000 n 
+0000006251 00000 n 
+0000006384 00000 n 
+0000006486 00000 n 
+0000006830 00000 n 
+0000006916 00000 n 
+trailer
+<<
+/Size 21
+/Root 20 0 R
+/Info 19 0 R
+/ID [ <C27CF4C12DB3995A30B3645E89B16322> <C27CF4C12DB3995A30B3645E89B16322> ]
+>>
+startxref
+7020
+%%EOF

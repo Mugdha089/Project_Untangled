@@ -8,20 +8,31 @@ import type {
 } from './untangle-api';
 
 export type EquipmentId = string;
-export type AuditStatus = 'matched' | 'missing' | 'pending';
+export type AuditStatus = 'matched' | 'missing' | 'pending' | 'ambiguous' | 'user-confirmed';
 
 export interface AuditTag {
   tag: string;
   type: string;
   bounds: string;
   row: number;
+  excelRows?: number[];
+  excelSheets?: (string | null)[];
   status: AuditStatus;
-  equipment: EquipmentId;
+  equipment: EquipmentId | null;
 }
 
 export interface WorkspaceMetrics {
   matched: number;
   total: number;
+  inventoryRows?: number;
+  usableInventoryRows?: number;
+  duplicateInventoryTags?: number;
+  detectedSourceTags?: number;
+  missing?: number;
+  ambiguous?: number;
+  clarificationItems?: number;
+  auditRows?: number;
+  pendingReviewTags?: number;
   retained: number;
   equipmentTotal: number;
   integrity: number | null;
@@ -45,7 +56,9 @@ export interface GraphEdgeView {
   id: string;
   source: EquipmentId;
   target: EquipmentId;
-  confidence: number;
+  confidence?: number;
+  evidenceStatus?: string;
+  sourceSegmentIds?: string[];
   flowDirection?: string;
   sourceBounds?: number[];
   sourcePage?: number;
@@ -55,25 +68,17 @@ export interface ClarificationView {
   id: string;
   near: string;
   tag: string;
-  confidence: number;
+  confidence?: number;
   question: string;
   options: string[];
   defaultRecommendation: string;
   status: string;
+  selectedOption?: string;
+  sourcePage?: number;
+  evidenceCropDataUri?: string;
 }
 
 export type Resolution = 'junction' | 'bridge' | 'unresolved';
-
-export const metrics: WorkspaceMetrics = {
-  matched: 142,
-  total: 145,
-  retained: 12,
-  equipmentTotal: 12,
-  integrity: null,
-  changedEdges: 0,
-  seconds: 2.84,
-  graphIntegrityLabel: 'Sample topology; not validated against a source drawing',
-};
 
 export const auditTags: AuditTag[] = [
   { tag: 'PT-101', type: 'Pressure Transmitter', bounds: '[120, 240, 180, 310]', row: 14, status: 'matched', equipment: 'TK-101' },
@@ -126,6 +131,26 @@ export const defaultGraphNodes: GraphNodeView[] = [
   { id: 'V-102', name: 'Vessel', kind: 'vessel', tags: 'PT-102 · LV-102', dutyStandby: false, label: 'Outlet Vessel V-102' },
 ];
 
+export const metrics: WorkspaceMetrics = {
+  matched: auditTags.filter(tag => tag.status === 'matched').length,
+  total: new Set(auditTags.map(tag => tag.tag)).size,
+  inventoryRows: auditTags.reduce((count, tag) => count + (tag.excelRows?.length ?? 1), 0),
+  usableInventoryRows: auditTags.reduce((count, tag) => count + (tag.excelRows?.length ?? 1), 0),
+  duplicateInventoryTags: auditTags.filter(tag => (tag.excelRows?.length ?? 1) > 1).length,
+  detectedSourceTags: auditTags.filter(tag => tag.status === 'matched').length,
+  missing: auditTags.filter(tag => tag.status === 'missing').length,
+  ambiguous: auditTags.filter(tag => tag.status === 'ambiguous').length,
+  clarificationItems: clarifications.length,
+  auditRows: auditTags.length,
+  pendingReviewTags: auditTags.filter(tag => tag.status === 'pending').length,
+  retained: defaultGraphNodes.length,
+  equipmentTotal: defaultGraphNodes.length,
+  integrity: null,
+  changedEdges: 0,
+  seconds: 2.84,
+  graphIntegrityLabel: 'Sample topology; not validated against a source drawing',
+};
+
 export const defaultGraphEdges: GraphEdgeView[] = [
   { id: 'edge_tk101_p101', source: 'TK-101', target: 'P-101', confidence: 0.94 },
   { id: 'edge_p101_e102', source: 'P-101', target: 'E-102', confidence: 0.94 },
@@ -147,20 +172,27 @@ export function resolveQueue(
 export function mapBackendStatus(status: string): AuditStatus {
   if (status === 'Matched') return 'matched';
   if (status === 'Missing in P&ID') return 'missing';
+  if (status === 'Ambiguous') return 'ambiguous';
   return 'pending';
 }
 
 export function formatBBox(bbox: number[], status: AuditStatus): string {
+  if (status === 'user-confirmed') return 'User-confirmed · source bounds unavailable';
   if (status === 'missing' || !bbox || bbox.every(v => v === 0)) return 'Not Detected';
-  if (status === 'pending') return `Ambiguous · [${bbox.join(', ')}]`;
+  if (status === 'pending' || status === 'ambiguous') return `Ambiguous · [${bbox.join(', ')}]`;
   return `[${bbox.join(', ')}]`;
 }
 
-function inferEquipmentForTag(tag: BackendTagAuditItem, nodes: BackendEquipmentNode[]): EquipmentId {
+export function markTagUserConfirmed(rows: AuditTag[], tagName: string): AuditTag[] {
+  return rows.map(row => row.tag === tagName
+    && row.status === 'missing'
+    ? { ...row, status: 'user-confirmed', bounds: 'User-confirmed · source bounds unavailable' }
+    : row);
+}
+
+function inferEquipmentForTag(tag: BackendTagAuditItem, nodes: BackendEquipmentNode[]): EquipmentId | null {
   const parent = nodes.find(n => n.collapsed_tags.includes(tag.tag_name));
-  if (parent) return parent.tag;
-  if (nodes.length) return nodes[0]!.tag;
-  return 'TK-101';
+  return parent?.tag ?? null;
 }
 
 export function mapKpis(kpis: BackendKpiSummary): WorkspaceMetrics {
@@ -169,7 +201,16 @@ export function mapKpis(kpis: BackendKpiSummary): WorkspaceMetrics {
   const changedMatch = kpis.graph_integrity.match(/(\d+)\s+changed/i);
   return {
     matched: kpis.matched_tags,
-    total: kpis.total_tags,
+    total: kpis.unique_inventory_tags ?? kpis.total_tags,
+    inventoryRows: kpis.inventory_rows ?? kpis.total_tags,
+    usableInventoryRows: kpis.usable_inventory_rows ?? kpis.total_tags,
+    duplicateInventoryTags: kpis.duplicate_inventory_tags ?? 0,
+    detectedSourceTags: kpis.detected_source_tags ?? kpis.matched_tags,
+    missing: kpis.missing_tags ?? Math.max(0, kpis.total_tags - kpis.matched_tags),
+    ambiguous: kpis.ambiguous_tags ?? 0,
+    clarificationItems: kpis.clarification_items ?? 0,
+    auditRows: kpis.audit_rows ?? kpis.total_tags,
+    pendingReviewTags: kpis.pending_review_tags ?? 0,
     retained: kpis.retained_equipment,
     equipmentTotal: kpis.retained_equipment,
     integrity,
@@ -190,6 +231,8 @@ export function mapAuditTags(
       type: row.type,
       bounds: formatBBox(row.source_bbox, status),
       row: row.excel_row,
+      excelRows: row.excel_rows ?? (row.excel_row > 0 ? [row.excel_row] : []),
+      excelSheets: row.excel_sheets ?? (row.excel_sheet ? [row.excel_sheet] : []),
       status,
       equipment: inferEquipmentForTag(row, nodes),
     };
@@ -214,10 +257,14 @@ export function mapGraphEdges(edges: BackendProcessEdge[]): GraphEdgeView[] {
     id: edge.id,
     source: edge.source,
     target: edge.target,
-    confidence: edge.confidence,
+    ...(edge.confidence != null ? { confidence: edge.confidence } : {}),
+    ...(edge.evidence_status ? { evidenceStatus: edge.evidence_status } : {}),
+    ...(edge.source_segment_ids
+      ? { sourceSegmentIds: edge.source_segment_ids }
+      : {}),
     flowDirection: edge.flow_direction,
-    sourceBounds: edge.source_bbox ?? undefined,
-    sourcePage: edge.source_page ?? undefined,
+    ...(edge.source_bbox ? { sourceBounds: edge.source_bbox } : {}),
+    ...(edge.source_page != null ? { sourcePage: edge.source_page } : {}),
   }));
 }
 
@@ -229,17 +276,25 @@ export function mapClarifications(items: BackendClarificationItem[]): Clarificat
       id: item.id,
       near: nearMatch?.[1] ?? item.location_label,
       tag: tagMatch?.[1] ?? item.id,
-      confidence: 90,
       question: item.question,
       options: item.options,
       defaultRecommendation: item.default_recommendation,
       status: item.status,
+        ...(item.confidence != null ? { confidence: item.confidence } : {}),
+      ...(item.selected_option ? { selectedOption: item.selected_option } : {}),
+      ...(item.source_page != null ? { sourcePage: item.source_page } : {}),
+      ...(item.evidence_crop_data_uri
+        ? { evidenceCropDataUri: item.evidence_crop_data_uri }
+        : {}),
     };
   });
 }
 
 export function mapProcessResponse(data: ProcessPidResponse) {
   return {
+    runId: data.run_id,
+    pdfFilename: data.pdf_filename,
+    excelFilename: data.excel_filename,
     metrics: mapKpis(data.kpis),
     auditTags: mapAuditTags(data.tag_audit, data.nodes),
     graphNodes: mapGraphNodes(data.nodes),

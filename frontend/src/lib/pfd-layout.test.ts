@@ -17,7 +17,14 @@ function node(id: string, kind = "pump", x?: number, y?: number, tags = ""): Gra
 }
 
 function edge(id: string, source: string, target: string, sourceBounds?: number[]): GraphEdgeView {
-  return { id, source, target, confidence: 1, flowDirection: "undirected", sourceBounds };
+  return {
+    id,
+    source,
+    target,
+    confidence: 1,
+    flowDirection: "undirected",
+    ...(sourceBounds ? { sourceBounds } : {}),
+  };
 }
 
 function pathSegments(path: string): number[][] {
@@ -133,6 +140,16 @@ describe("simplified PFD layout", () => {
 
     expect(result.nodes.filter((item) => item.kind === "junction")).toHaveLength(2);
     expect(result.routes).toHaveLength(edges.length);
+    expect(result.nodes.map((item) => item.id).sort()).toEqual(
+      nodes.map((item) => item.id).sort(),
+    );
+    expect(
+      result.routes
+        .map(({ edge: item }) => [item.source, item.target].sort().join("|"))
+        .sort(),
+    ).toEqual(
+      edges.map((item) => [item.source, item.target].sort().join("|")).sort(),
+    );
     expect(result.routes.every((route) => /L/.test(route.path))).toBe(true);
     for (let index = 0; index < result.nodes.length; index += 1) {
       for (const other of result.nodes.slice(index + 1)) {
@@ -171,7 +188,7 @@ describe("simplified PFD layout", () => {
     expect(recycle.recycle).toBe(true);
     expect(
       pathSegments(recycle.path).some(
-        ([, y]) => y < Math.min(...result.nodes.map((item) => item.y)),
+        ([, y]) => y! < Math.min(...result.nodes.map((item) => item.y)),
       ),
     ).toBe(true);
   });
@@ -198,5 +215,16 @@ describe("simplified PFD layout", () => {
     }
     expect(result.width).toBeGreaterThanOrEqual(640);
     expect(result.height).toBeGreaterThanOrEqual(360);
+  });
+
+  it("allocates enough vertical space for dense collapsed instrument labels", () => {
+    const tags = "PT-101 · FT-101 · LT-101 · TT-101 · PI-101";
+    const result = layoutPfd(
+      [node("P-101", "pump", 100, 100, tags), node("V-101", "vessel", 100, 200)],
+      [],
+    );
+    const pump = result.nodes.find((item) => item.id === "P-101")!;
+    const vessel = result.nodes.find((item) => item.id === "V-101")!;
+    expect(Math.abs(pump.y - vessel.y)).toBeGreaterThanOrEqual(206);
   });
 });

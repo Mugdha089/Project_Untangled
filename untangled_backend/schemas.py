@@ -7,6 +7,25 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthUser(BaseModel):
+    user_id: str
+    email: str
+    full_name: str
+    role: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_at: int
+    user: AuthUser
+
+
 TagStatus = Literal["Matched", "Missing in P&ID", "Pending Review", "Ambiguous"]
 EquipmentType = Literal[
     "tank",
@@ -33,8 +52,12 @@ class TagAuditItem(BaseModel):
     )
     source_page: Optional[int] = None
     excel_row: int
+    excel_rows: List[int] = Field(default_factory=list)
+    excel_sheet: Optional[str] = None
+    excel_sheets: List[Optional[str]] = Field(default_factory=list)
     status: TagStatus
     confidence: float = Field(..., ge=0.0, le=1.0)
+    reason: Optional[str] = None
 
 
 class EquipmentNode(BaseModel):
@@ -63,7 +86,9 @@ class ProcessEdge(BaseModel):
     target: str
     flow_direction: str
     relation: str
-    confidence: float = Field(..., ge=0.0, le=1.0)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    evidence_status: str = "source_geometry"
+    source_segment_ids: List[str] = Field(default_factory=list)
     source_page: Optional[int] = None
     source_bbox: Optional[List[int]] = Field(default=None, min_length=4, max_length=4)
 
@@ -75,47 +100,94 @@ class ClarificationItem(BaseModel):
     location_label: str
     question: str
     crop_bbox: List[int] = Field(..., min_length=4, max_length=4)
+    source_page: int = 0
+    evidence_crop_data_uri: Optional[str] = None
     default_recommendation: str
     options: List[str]
     status: str
+    selected_option: Optional[str] = None
+
+
+class ClarificationDecision(BaseModel):
+    """Persisted user choice for one run's clarification item."""
+
+    item_id: str
+    selected_option: str
+    status: str
+    updated_at: str
 
 
 class KpiSummary(BaseModel):
-    """Aggregate processing KPIs returned with every pipeline run."""
+    """Counts for Excel rows, unique tags, source detections, audit statuses and clarification items."""
 
     total_tags: int
     matched_tags: int
     retained_equipment: int
     graph_integrity: str
     processing_time_seconds: float
+    inventory_rows: int = 0
+    usable_inventory_rows: int = 0
+    unique_inventory_tags: int = 0
+    duplicate_inventory_tags: int = 0
+    duplicate_inventory_rows: int = 0
+    detected_source_tags: int = 0
+    missing_tags: int = 0
+    ambiguous_tags: int = 0
+    pdf_only_tags: int = 0
+    pending_review_tags: int = 0
+    audit_rows: int = 0
+    clarification_items: int = 0
 
 
 class ProcessPidResponse(BaseModel):
     """Complete end-to-end pipeline payload for the frontend workspace."""
 
+    run_id: str
+    created_at: str
     kpis: KpiSummary
     nodes: List[EquipmentNode]
     edges: List[ProcessEdge]
     tag_audit: List[TagAuditItem]
     clarification_queue: List[ClarificationItem]
     pdf_page_count: int
+    pdf_filename: str
+    excel_filename: str
+    clarification_decisions: List[ClarificationDecision] = Field(default_factory=list)
+
+
+class RunSummary(BaseModel):
+    """Concise metadata for a saved processing run."""
+
+    run_id: str
+    created_at: str
+    pdf_filename: str
+    excel_filename: str
+    kpis: KpiSummary
+
+
+class RunListResponse(BaseModel):
+    runs: List[RunSummary]
 
 
 class ResolveAmbiguityRequest(BaseModel):
     """Payload for resolving a clarification-queue item."""
 
+    run_id: str
     item_id: str
     selected_option: str
 
 
 class ResolveAmbiguityResponse(BaseModel):
-    """Updated KPIs and edges after an ambiguity resolution."""
+    """Updated graph and KPIs after a clarification decision."""
 
+    run_id: str
     kpis: KpiSummary
+    nodes: List[EquipmentNode] = Field(default_factory=list)
     edges: List[ProcessEdge]
     resolved_item_id: str
     selected_option: str
     message: str
+    topology_changed: bool = False
 
 
 class HealthResponse(BaseModel):

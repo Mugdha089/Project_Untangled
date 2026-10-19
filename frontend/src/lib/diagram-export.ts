@@ -10,7 +10,8 @@ export async function exportDiagram(format: 'SVG' | 'PNG' | 'PDF') {
     if (!copy) return;
     for (const prop of ['fill', 'stroke', 'stroke-width', 'font-family', 'font-size', 'font-weight', 'opacity', 'stroke-dasharray', 'color']) copy.setAttribute(prop, computed.getPropertyValue(prop));
   });
-  clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  // XMLSerializer emits the SVG namespace for SVG namespace nodes. Adding a
+  // plain xmlns attribute here can serialize it twice and invalidate the XML.
   clone.setAttribute('width', '1200'); clone.setAttribute('height', '700');
   const text = new XMLSerializer().serializeToString(clone);
   let blob = new Blob([text], { type: 'image/svg+xml' });

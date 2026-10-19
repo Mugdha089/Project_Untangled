@@ -20,3 +20,8 @@
 .pfd-zoom-controls{display:flex;align-items:center;gap:2px;margin-left:auto;font-family:var(--font-mono);font-size:8px;color:var(--muted-foreground)}.pfd-zoom-controls button{height:24px;min-width:24px;padding:0 5px}.pfd-zoom-controls button svg{width:12px;height:12px}.pfd-zoom-controls span{min-width:28px;text-align:center}.pfd-viewer .validated-badge{margin-left:0;white-space:nowrap}
 .pfd-canvas{overflow:auto;justify-content:flex-start;align-items:flex-start}.pfd-diagram{position:relative;flex:none;margin:auto}.process-svg{width:100%;height:100%}
 .unverified-badge{color:var(--warning)}.unverified-badge svg{color:var(--warning)}.unverified-text{display:flex;align-items:center;gap:5px;color:var(--warning)}
+/* Keep review states visually distinct from source-detected matches. */
+.status-dot.ambiguous { background: var(--warning); }
+.status-dot.user-confirmed { background: var(--primary); }
+.clarification-source-evidence{margin:14px 0;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:#101c25}.clarification-source-evidence img{display:block;width:100%;max-height:230px;object-fit:contain}.clarification-source-evidence figcaption{padding:6px 10px;color:var(--muted-foreground);font-size:11px}
+.source-tag-evidence .metadata-text{fill:var(--foreground);font-size:8px}.source-tag-matched{fill:var(--success)}.source-tag-review{fill:var(--warning)}

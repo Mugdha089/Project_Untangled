@@ -8,20 +8,21 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
 
+from topology_evidence import (
+    CONNECTED_JUNCTION,
+    CROSSOVER,
+    find_ambiguous_process_crossings,
+    find_equipment_nozzle_endpoints,
+)
+
 logger = logging.getLogger(__name__)
 
-# Secondary loop instrument prefixes collapsed into equipment metadata pills.
+# Source-detected loop instrument prefixes shown as equipment metadata when an
+# explicit parent association is available.
 SENSOR_PREFIXES: Set[str] = {"PT", "FT", "LT", "TT", "PI", "FI", "LI", "TI"}
 CONTROLLER_PREFIXES: Set[str] = {"PC", "FC", "LC", "TC"}
 VALVE_PREFIXES: Set[str] = {"LV", "FV", "XV", "PV", "HV"}
 LOOP_PREFIXES: Set[str] = SENSOR_PREFIXES | CONTROLLER_PREFIXES | VALVE_PREFIXES
-CONTROL_LOOP_ASSIGNMENTS: Dict[str, str] = {
-    "FT-10": "P-201",
-    "FV-3-3040": "P-201",
-    "FT-11": "P-504",
-    "FV-3-3041": "P-504",
-}
-
 def _tag_prefix(tag: str) -> str:
     return tag.split("-")[0].upper() if tag else ""
 
@@ -34,7 +35,7 @@ def _build_equipment_nodes(
     equipment: List[Dict[str, Any]],
     audit_tags: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    """Build one node per detected item and attach control-loop tags."""
+    """Build detected equipment nodes and attach supported matched loop tags."""
     nodes: List[Dict[str, Any]] = []
     seen_tags: Set[str] = set()
     for eq in equipment:
@@ -58,53 +59,23 @@ def _build_equipment_nodes(
             }
         )
 
-    # Map excel/pdf tags onto nearest primary equipment for loop collapse.
+    # Only use the parent association supplied by the evidence pipeline. Do not
+    # guess a parent from tag numbering when the source does not establish one.
     node_by_tag = {n["tag"]: n for n in nodes}
 
     for audit in audit_tags:
         tag_name = audit.get("tag_name", "")
         if not _is_loop_instrument(tag_name):
             continue
-        if audit.get("status") == "Missing in P&ID":
-            # Still attach missing tags as collapsed metadata on parent equipment
-            # so the I/O list remains visible on the sketch.
-            parent = audit.get("parent_equipment")
-            if parent and parent in node_by_tag:
-                if tag_name not in node_by_tag[parent]["collapsed_tags"]:
-                    node_by_tag[parent]["collapsed_tags"].append(tag_name)
+        if audit.get("status") != "Matched":
             continue
 
         parent = audit.get("parent_equipment")
-        parent = CONTROL_LOOP_ASSIGNMENTS.get(tag_name, parent)
-        if parent not in node_by_tag:
-            # Fallback: attach sensors to nearest equipment by prefix heuristics.
-            parent = _heuristic_parent(tag_name, list(node_by_tag.keys()))
         if parent and parent in node_by_tag:
             if tag_name not in node_by_tag[parent]["collapsed_tags"]:
                 node_by_tag[parent]["collapsed_tags"].append(tag_name)
 
     return _order_nodes_left_to_right(nodes)
-
-
-def _heuristic_parent(tag_name: str, equipment_tags: List[str]) -> Optional[str]:
-    """Prefer equipment whose numeric id is closest to the instrument number."""
-    try:
-        tag_num = int("".join(ch for ch in tag_name.split("-")[-1] if ch.isdigit()) or "0")
-    except ValueError:
-        return equipment_tags[0] if equipment_tags else None
-
-    best = None
-    best_delta = float("inf")
-    for eq_tag in equipment_tags:
-        try:
-            eq_num = int("".join(ch for ch in eq_tag.split("-")[-1] if ch.isdigit()) or "0")
-        except ValueError:
-            continue
-        delta = abs(eq_num - tag_num)
-        if delta < best_delta:
-            best_delta = delta
-            best = eq_tag
-    return best
 
 
 def _order_nodes_left_to_right(
@@ -141,7 +112,8 @@ def _point_on_segment(
     projection = (
         (point[0] - start[0]) * dx + (point[1] - start[1]) * dy
     ) / length_squared
-    if projection < -tolerance or projection > 1 + tolerance:
+    fraction_tolerance = tolerance / math.sqrt(length_squared)
+    if projection < -fraction_tolerance or projection > 1 + fraction_tolerance:
         return False
     closest = (start[0] + projection * dx, start[1] + projection * dy)
     return math.dist(point, closest) <= tolerance
@@ -172,6 +144,78 @@ def _coordinate_key(point: Tuple[float, float]) -> Tuple[float, float]:
     return round(point[0], 2), round(point[1], 2)
 
 
+def _endpoint_tolerance(page_bounds: Optional[List[float]]) -> float:
+    """Return a scale-aware snap tolerance in PDF points (0.05–0.14% of diagonal).
+
+    The tolerance is bounded to 0.5–2.0 points so page size affects scaling
+    without allowing visibly separated line ends to become connected.
+    """
+    if page_bounds is None or len(page_bounds) != 4:
+        return 1.0
+    width = max(0.0, float(page_bounds[2]) - float(page_bounds[0]))
+    height = max(0.0, float(page_bounds[3]) - float(page_bounds[1]))
+    if width == 0.0 or height == 0.0:
+        return 1.0
+    return max(0.5, min(2.0, math.hypot(width, height) * 0.001))
+
+
+def _snap_segment_endpoints(
+    segments: List[Dict[str, Any]], tolerance: float
+) -> None:
+    """Join only line endpoints within the page-scale geometric tolerance."""
+    endpoints = [
+        (segment_index, endpoint_name, segment[endpoint_name])
+        for segment_index, segment in enumerate(segments)
+        for endpoint_name in ("start", "end")
+    ]
+    cell_size = max(tolerance, 0.1)
+    buckets: Dict[Tuple[int, int], List[int]] = {}
+    clusters: Dict[int, List[int]] = {}
+    endpoint_cluster: Dict[int, int] = {}
+    for index, (_, _, point) in enumerate(endpoints):
+        cell = (math.floor(point[0] / cell_size), math.floor(point[1] / cell_size))
+        nearby: Set[int] = set()
+        for x_offset in (-1, 0, 1):
+            for y_offset in (-1, 0, 1):
+                nearby.update(
+                    buckets.get((cell[0] + x_offset, cell[1] + y_offset), [])
+                )
+        candidate_clusters = sorted(
+            {endpoint_cluster[candidate] for candidate in nearby}
+        )
+        selected_cluster = next(
+            (
+                cluster_id
+                for cluster_id in candidate_clusters
+                if all(
+                    math.dist(point, endpoints[member][2]) <= tolerance
+                    for member in clusters[cluster_id]
+                )
+            ),
+            None,
+        )
+        if selected_cluster is None:
+            selected_cluster = index
+            clusters[selected_cluster] = []
+        clusters[selected_cluster].append(index)
+        endpoint_cluster[index] = selected_cluster
+        buckets.setdefault(cell, []).append(index)
+
+    representatives = {
+        root: _coordinate_key(
+            (
+                sum(endpoints[index][2][0] for index in members) / len(members),
+                sum(endpoints[index][2][1] for index in members) / len(members),
+            )
+        )
+        for root, members in clusters.items()
+    }
+    for index, (segment_index, endpoint_name, _) in enumerate(endpoints):
+        segments[segment_index][endpoint_name] = representatives[
+            endpoint_cluster[index]
+        ]
+
+
 def _source_bbox_for_path(points: List[Tuple[float, float]]) -> List[int]:
     return [
         int(round(min(point[0] for point in points))),
@@ -184,6 +228,8 @@ def _source_bbox_for_path(points: List[Tuple[float, float]]) -> List[int]:
 def _build_geometry_edges(
     nodes: List[Dict[str, Any]],
     drawing_evidence: Optional[Dict[str, Any]],
+    crossing_resolutions: Optional[Dict[str, str]] = None,
+    nozzle_resolutions: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
     """Trace legend-classified process strokes and retain branch junctions."""
     segments_by_page: Dict[int, List[Dict[str, Any]]] = {}
@@ -199,7 +245,11 @@ def _build_geometry_edges(
         if len(start) != 2 or len(end) != 2 or math.dist(start, end) < 4:
             continue
         segments_by_page.setdefault(page, []).append(
-            {"start": start, "end": end}
+            {
+                "id": str(segment.get("id") or f"p{page}_s{len(segments_by_page.get(page, []))}"),
+                "start": start,
+                "end": end,
+            }
         )
 
     edges: List[Dict[str, Any]] = []
@@ -208,6 +258,11 @@ def _build_geometry_edges(
     junction_index = 0
 
     for page, segments in segments_by_page.items():
+        page_bounds = (drawing_evidence or {}).get("page_bounds", {}).get(
+            str(page)
+        )
+        tolerance = _endpoint_tolerance(page_bounds)
+        _snap_segment_endpoints(segments, tolerance)
         graph = nx.Graph()
         endpoints = {
             _coordinate_key(point)
@@ -224,62 +279,114 @@ def _build_geometry_edges(
 
         for index, segment in enumerate(segments):
             for point in endpoints:
-                if _point_on_segment(point, segment["start"], segment["end"]):
+                if _point_on_segment(
+                    point, segment["start"], segment["end"], tolerance
+                ):
                     split_points[index].add(point)
 
+        for crossing in find_ambiguous_process_crossings(drawing_evidence):
+            if crossing["page"] != page:
+                continue
+            if (crossing_resolutions or {}).get(crossing["id"]) != CONNECTED_JUNCTION:
+                continue
+            first_index, second_index = crossing["segment_indices"]
+            if first_index >= len(segments) or second_index >= len(segments):
+                continue
+            point = _coordinate_key(tuple(crossing["point"]))
+            split_points[first_index].add(point)
+            split_points[second_index].add(point)
+
         equipment_points: Dict[str, Set[Tuple[float, float]]] = {}
+        provisional_nozzle_segments: Set[str] = set()
+        confirmed_nozzle_segments: Set[str] = set()
+        nodes_by_tag = {str(node["tag"]): node for node in nodes}
+        matched_equipment: Set[str] = set()
+
+        # A process stroke that traverses the full symbol bounds on its
+        # centreline is direct geometric evidence of an in-line connection.
+        # Add only the two symbol-boundary points; nearby parallel strokes do
+        # not satisfy this intersection test.
+        for equipment_node in nodes:
+            if int(equipment_node.get("source_page", 0)) != page:
+                continue
+            symbol_bbox = equipment_node.get("source_symbol_bbox") or []
+            if len(symbol_bbox) != 4:
+                continue
+            x1, y1, x2, y2 = map(float, symbol_bbox)
+            center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
+            alignment_tolerance = max(2.0, min(x2 - x1, y2 - y1) * 0.05)
+            for index, segment in enumerate(segments):
+                start, end = segment["start"], segment["end"]
+                if (
+                    abs(start[1] - end[1]) <= tolerance
+                    and abs((start[1] + end[1]) / 2 - center_y)
+                    <= alignment_tolerance
+                    and min(start[0], end[0]) <= x1 + tolerance
+                    and max(start[0], end[0]) >= x2 - tolerance
+                ):
+                    points = {
+                        _coordinate_key((x1, (start[1] + end[1]) / 2)),
+                        _coordinate_key((x2, (start[1] + end[1]) / 2)),
+                    }
+                elif (
+                    abs(start[0] - end[0]) <= tolerance
+                    and abs((start[0] + end[0]) / 2 - center_x)
+                    <= alignment_tolerance
+                    and min(start[1], end[1]) <= y1 + tolerance
+                    and max(start[1], end[1]) >= y2 - tolerance
+                ):
+                    points = {
+                        _coordinate_key(((start[0] + end[0]) / 2, y1)),
+                        _coordinate_key(((start[0] + end[0]) / 2, y2)),
+                    }
+                else:
+                    continue
+                split_points[index].update(points)
+                equipment_points.setdefault(str(equipment_node["tag"]), set()).update(points)
+                matched_equipment.add(str(equipment_node["tag"]))
+
+        nozzle_candidates = find_equipment_nozzle_endpoints(drawing_evidence, nodes)
+        for nozzle in nozzle_candidates:
+            if nozzle["page"] != page:
+                continue
+            selected = (nozzle_resolutions or {}).get(nozzle["id"])
+            tag = nozzle["equipment_tag"]
+            connected_option = f"Connected to {tag}"
+            disconnected_option = f"Not connected to {tag}"
+            if nozzle["needs_review"] and selected == disconnected_option:
+                continue
+            if nozzle["needs_review"] and selected not in (
+                None,
+                connected_option,
+                "Unresolved / Keep Flagged",
+            ):
+                continue
+            node = nodes_by_tag.get(tag)
+            if node is None or int(node.get("source_page", 0)) != page:
+                continue
+            point = _coordinate_key(tuple(nozzle["point"]))
+            segment_index = int(nozzle["segment_index"])
+            if segment_index >= len(segments):
+                continue
+            split_points[segment_index].add(point)
+            equipment_points.setdefault(tag, set()).add(point)
+            matched_equipment.add(tag)
+            if nozzle["needs_review"] and selected == connected_option:
+                confirmed_nozzle_segments.add(nozzle["segment_id"])
+            elif nozzle["needs_review"]:
+                provisional_nozzle_segments.add(nozzle["segment_id"])
+
         for equipment_node in nodes:
             if int(equipment_node.get("source_page", 0)) != page:
                 continue
             bbox = equipment_node.get("source_bbox") or [0, 0, 0, 0]
-            if len(bbox) != 4 or bbox == [0, 0, 0, 0]:
-                unresolved_equipment += 1
-                continue
             symbol_bbox = equipment_node.get("source_symbol_bbox") or []
-            if len(symbol_bbox) != 4:
-                unresolved_equipment += 1
-                continue
-            anchor_bbox = symbol_bbox
-            center = (
-                (float(anchor_bbox[0]) + float(anchor_bbox[2])) / 2,
-                (float(anchor_bbox[1]) + float(anchor_bbox[3])) / 2,
-            )
-            projections = []
-            for index, segment in enumerate(segments):
-                distance, projected = _project_point(
-                    center, segment["start"], segment["end"]
-                )
-                margin = 18.0
-                in_symbol_region = (
-                    float(symbol_bbox[0]) - margin
-                    <= projected[0]
-                    <= float(symbol_bbox[2]) + margin
-                    and float(symbol_bbox[1]) - margin
-                    <= projected[1]
-                    <= float(symbol_bbox[3]) + margin
-                )
-                projections.append(
-                    (distance, index, _coordinate_key(projected), in_symbol_region)
-                )
-            if not projections:
-                unresolved_equipment += 1
-                continue
-            symbol_candidates = {
-                (index, point)
-                for _, index, point, in_symbol_region in projections
-                if in_symbol_region
-            }
-            if not symbol_candidates:
-                unresolved_equipment += 1
-                continue
-            candidates = symbol_candidates
-            points = set()
-            for index, point in candidates:
-                split_points[index].add(point)
-                points.add(point)
-            if points:
-                equipment_points[equipment_node["tag"]] = points
-            else:
+            if (
+                len(bbox) != 4
+                or bbox == [0, 0, 0, 0]
+                or len(symbol_bbox) != 4
+                or not equipment_points.get(str(equipment_node["tag"]))
+            ):
                 unresolved_equipment += 1
 
         point_owners: Dict[Tuple[float, float], List[str]] = {}
@@ -307,7 +414,19 @@ def _build_geometry_edges(
                 source, target = graph_vertex(first), graph_vertex(second)
                 if source == target:
                     continue
-                graph.add_edge(source, target, page=page, points=[first, second])
+                existing = graph.get_edge_data(source, target)
+                if existing is None:
+                    graph.add_edge(
+                        source,
+                        target,
+                        page=page,
+                        points=[first, second],
+                        source_segment_ids=[segment["id"]],
+                    )
+                else:
+                    existing.setdefault("source_segment_ids", []).append(
+                        segment["id"]
+                    )
 
         for tag, points in equipment_points.items():
             if any(len(point_owners.get(point, [])) > 1 for point in points):
@@ -362,10 +481,14 @@ def _build_geometry_edges(
                     continue
                 visited.add(path_key)
                 path_points: List[Tuple[float, float]] = []
+                path_segment_ids: List[str] = []
                 previous, current = start_vertex, neighbor
                 while current not in meaningful:
                     edge_data = graph.get_edge_data(previous, current) or {}
                     path_points.extend(edge_data.get("points", []))
+                    path_segment_ids.extend(
+                        edge_data.get("source_segment_ids", [])
+                    )
                     next_vertices = [
                         candidate
                         for candidate in graph.neighbors(current)
@@ -378,6 +501,7 @@ def _build_geometry_edges(
                     previous, current = current, next_vertex
                 edge_data = graph.get_edge_data(previous, current) or {}
                 path_points.extend(edge_data.get("points", []))
+                path_segment_ids.extend(edge_data.get("source_segment_ids", []))
                 target_tag = output_tag.get(current)
                 if target_tag is None or start_tag == target_tag:
                     continue
@@ -390,27 +514,84 @@ def _build_geometry_edges(
                 ):
                     continue
                 pair = tuple(sorted((start_tag, target_tag)))
-                if any(
-                    (edge["source"], edge["target"]) == pair
-                    or (edge["target"], edge["source"]) == pair
-                    for edge in edges
-                ):
-                    continue
                 unique_points = list(dict.fromkeys(path_points))
-                edges.append(
-                    {
-                        "id": f"edge_{pair[0]}_{pair[1]}".replace("-", "").lower(),
-                        "source": pair[0],
-                        "target": pair[1],
-                        "flow_direction": "undirected",
-                        "relation": "process_pipe",
-                        "confidence": 0.85,
-                        "source_page": page,
-                        "source_bbox": _source_bbox_for_path(unique_points)
-                        if unique_points
-                        else [0, 0, 0, 0],
-                    }
+                path_segment_ids = list(dict.fromkeys(path_segment_ids))
+                user_confirmed_crossing = any(
+                    (crossing_resolutions or {}).get(crossing["id"])
+                    == CONNECTED_JUNCTION
+                    and crossing["page"] == page
+                    and any(
+                        math.dist(point, tuple(crossing["point"])) <= tolerance
+                        for point in unique_points
+                    )
+                    for crossing in find_ambiguous_process_crossings(
+                        drawing_evidence
+                    )
                 )
+                path_uses_confirmed_nozzle = bool(
+                    set(path_segment_ids) & confirmed_nozzle_segments
+                )
+                path_uses_provisional_nozzle = bool(
+                    set(path_segment_ids) & provisional_nozzle_segments
+                )
+                existing_edge = next(
+                    (
+                        edge
+                        for edge in edges
+                        if (edge["source"], edge["target"]) == pair
+                        or (edge["target"], edge["source"]) == pair
+                    ),
+                    None,
+                )
+                if existing_edge is None:
+                    edges.append(
+                        {
+                            "id": f"edge_{pair[0]}_{pair[1]}".replace("-", "").lower(),
+                            "source": pair[0],
+                            "target": pair[1],
+                            "flow_direction": "undirected",
+                            "relation": "process_pipe",
+                            "evidence_status": (
+                                "user_confirmed_crossing"
+                                if user_confirmed_crossing
+                                else "user_confirmed_nozzle"
+                                if path_uses_confirmed_nozzle
+                                else "provisional_nozzle_alignment"
+                                if path_uses_provisional_nozzle
+                                else "source_geometry"
+                            ),
+                            "source_segment_ids": path_segment_ids,
+                            "source_page": page,
+                            "source_bbox": _source_bbox_for_path(unique_points)
+                            if unique_points
+                            else [0, 0, 0, 0],
+                        }
+                    )
+                else:
+                    if user_confirmed_crossing:
+                        existing_edge["evidence_status"] = "user_confirmed_crossing"
+                    elif path_uses_confirmed_nozzle:
+                        existing_edge["evidence_status"] = "user_confirmed_nozzle"
+                    elif (
+                        path_uses_provisional_nozzle
+                        and existing_edge.get("evidence_status") == "source_geometry"
+                    ):
+                        existing_edge["evidence_status"] = "provisional_nozzle_alignment"
+                    existing_edge["source_segment_ids"] = list(
+                        dict.fromkeys(
+                            existing_edge.get("source_segment_ids", [])
+                            + path_segment_ids
+                        )
+                    )
+                    if unique_points:
+                        existing_bbox = existing_edge.get("source_bbox") or [0, 0, 0, 0]
+                        path_bbox = _source_bbox_for_path(unique_points)
+                        existing_edge["source_bbox"] = [
+                            min(existing_bbox[0], path_bbox[0]),
+                            min(existing_bbox[1], path_bbox[1]),
+                            max(existing_bbox[2], path_bbox[2]),
+                            max(existing_bbox[3], path_bbox[3]),
+                        ]
 
     return edges, junction_nodes, unresolved_equipment
 
@@ -419,6 +600,8 @@ def build_process_graph(
     equipment: List[Dict[str, Any]],
     audit_tags: List[Dict[str, Any]],
     drawing_evidence: Optional[Dict[str, Any]] = None,
+    crossing_resolutions: Optional[Dict[str, str]] = None,
+    nozzle_resolutions: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
     Construct process topology only from legend-classified source pipe geometry.
@@ -429,7 +612,7 @@ def build_process_graph(
         graph.add_node(node["tag"], **node)
 
     edges, junction_nodes, unresolved_equipment = _build_geometry_edges(
-        nodes, drawing_evidence
+        nodes, drawing_evidence, crossing_resolutions, nozzle_resolutions
     )
     nodes.extend(junction_nodes)
     for node in junction_nodes:
@@ -455,6 +638,38 @@ def build_process_graph(
         )
         if unresolved_equipment:
             integrity += f" {unresolved_equipment} equipment location(s) unresolved."
+
+    crossings = find_ambiguous_process_crossings(drawing_evidence)
+    resolutions = crossing_resolutions or {}
+    confirmed_crossings = sum(
+        resolutions.get(crossing["id"]) in {CONNECTED_JUNCTION, CROSSOVER}
+        for crossing in crossings
+    )
+    unresolved_crossings = len(crossings) - confirmed_crossings
+    if confirmed_crossings:
+        integrity += f" {confirmed_crossings} crossing interpretation(s) are user-confirmed."
+    if unresolved_crossings:
+        integrity += (
+            f" {unresolved_crossings} process-line crossing(s) remain unresolved; "
+            "their connectivity is provisional."
+        )
+    provisional_nozzles = {
+        edge["id"]
+        for edge in edges
+        if edge.get("evidence_status") == "provisional_nozzle_alignment"
+    }
+    confirmed_nozzles = {
+        edge["id"]
+        for edge in edges
+        if edge.get("evidence_status") == "user_confirmed_nozzle"
+    }
+    if provisional_nozzles:
+        integrity += (
+            f" {len(provisional_nozzles)} equipment connection(s) use aligned "
+            "nozzle geometry pending review; connectivity is provisional."
+        )
+    if confirmed_nozzles:
+        integrity += f" {len(confirmed_nozzles)} equipment connection(s) are user-confirmed."
 
     logger.info(
         "Graph built from source geometry: %d equipment/junction nodes, %d edges, status=%s",
@@ -491,6 +706,10 @@ def build_process_graph(
         "edge_count_after_layout": len(edges),
         "changed_edges": 0,
         "retained_equipment": sum(1 for node in nodes if node["type"] != "junction"),
+        "user_confirmed_crossings": sum(
+            choice in {CONNECTED_JUNCTION, CROSSOVER}
+            for choice in (crossing_resolutions or {}).values()
+        ),
         "nx_graph": graph,
     }
 
@@ -520,7 +739,7 @@ def apply_ambiguity_resolution(
     matched_tags: int,
     processing_time_seconds: float = 0.12,
 ) -> Dict[str, Any]:
-    """Keep graph status honest when a user resolves a visual clarification."""
+    """Record review context without claiming the source graph was recalculated."""
     updated_edges = [dict(e) for e in edges]
     if updated_edges:
         integrity = (
@@ -542,7 +761,7 @@ def apply_ambiguity_resolution(
     }
 
     logger.info(
-        "Ambiguity %s resolved as '%s' → integrity=%s",
+        "Ambiguity %s recorded as '%s'; topology unchanged → integrity=%s",
         item_id,
         selected_option,
         integrity,

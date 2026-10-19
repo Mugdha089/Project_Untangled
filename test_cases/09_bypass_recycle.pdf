@@ -1,0 +1,445 @@
+%PDF-1.3
+%ºß¬à
+3 0 obj
+<</Type /Page
+/Parent 1 0 R
+/Resources 2 0 R
+/MediaBox [0 0 800. 600.]
+/Contents 4 0 R
+>>
+endobj
+4 0 obj
+<<
+/Length 3193
+>>
+stream
+0.200025 w
+0 G
+BT
+/F2 17 Tf
+19.5499999999999972 TL
+0 g
+28. 576. Td
+(UNTANGLE SYNTHETIC P&ID TEST FIXTURE) Tj
+ET
+BT
+/F1 9 Tf
+10.3499999999999996 TL
+0 g
+28. 555. Td
+(For software regression testing only - not for plant operation or construction) Tj
+ET
+0.1 0.33 0.41 RG
+1.5 w
+28. 533. m
+53. 533. l
+S
+BT
+/F1 9 Tf
+10.3499999999999996 TL
+0 g
+59. 530. Td
+(PROCESS PIPE) Tj
+ET
+0.67 0.69 0.71 RG
+0.8 w
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+55. 323. m
+77. 323. l
+80.8659932488155562 323. 84. 319.8659932488155277 84. 316. c
+84. 284. l
+84. 280.1340067511844723 80.1340067511844438 277. 77. 277. c
+55. 277. l
+51.1340067511844438 277. 48. 280.8659932488155277 48. 284. c
+48. 316. l
+48. 319.8659932488155277 51.8659932488155562 323. 55. 323. c
+h
+B
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+51.105000000000004 264. Td
+(TK-901) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+216. 300. m
+216. 307.7319864976311123 209.7319864976311123 314. 202. 314. c
+194.2680135023688877 314. 188. 307.7319864976311123 188. 300. c
+188. 292.2680135023688877 194.2680135023688877 286. 202. 286. c
+209.7319864976311123 286. 216. 292.2680135023688877 216. 300. c
+B
+195. 300. m
+209. 307. l
+S
+209. 307. m
+209. 293. l
+S
+209. 293. m
+195. 300. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+190.1200000000000045 264. Td
+(P-901) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+400. 314. 40. -28. re
+B
+406. 310. m
+434. 290. l
+S
+406. 290. m
+434. 310. l
+S
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+408.1200000000000045 264. Td
+(E-901) Tj
+ET
+0.21 0.27 0.31 RG
+0.97 0.98 0.98 rg
+1.1000000000000001 w
+659. 323. m
+681. 323. l
+684.8659932488155846 323. 688. 319.8659932488155277 688. 316. c
+688. 284. l
+688. 280.1340067511844723 684.1340067511844154 277. 681. 277. c
+659. 277. l
+655.1340067511844154 277. 652. 280.8659932488155277 652. 284. c
+652. 316. l
+652. 319.8659932488155277 655.8659932488155846 323. 659. 323. c
+h
+B
+BT
+/F2 9 Tf
+10.3499999999999996 TL
+0.078 0.141 0.176 rg
+658.1200000000000045 264. Td
+(V-901) Tj
+ET
+0.1 0.33 0.41 RG
+1.5 w
+84. 300. m
+184. 300. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+220. 300. m
+400. 300. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+440. 300. m
+652. 300. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+260. 300. m
+260. 410. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+260. 410. m
+420. 410. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+420. 410. m
+420. 320. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+688. 300. m
+745. 300. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+745. 300. m
+745. 125. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+745. 125. m
+202. 125. l
+S
+0.1 0.33 0.41 RG
+1.5 w
+202. 125. m
+202. 282. l
+S
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+155. 320. Td
+(PT-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+505. 320. Td
+(FT-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+438. 388. Td
+(TT-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+670. 335. Td
+(LT-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+325. 420. Td
+(FV-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+122. 275. Td
+(PI-901) Tj
+ET
+BT
+/F1 8 Tf
+9.1999999999999993 TL
+0.137 0.176 0.196 rg
+225. 65. Td
+(Top branch: exchanger bypass | lower return: recycle to pump suction) Tj
+ET
+endstream
+endobj
+1 0 obj
+<</Type /Pages
+/Kids [3 0 R ]
+/Count 1
+>>
+endobj
+5 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+6 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+7 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-Oblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+8 0 obj
+<<
+/Type /Font
+/BaseFont /Helvetica-BoldOblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+9 0 obj
+<<
+/Type /Font
+/BaseFont /Courier
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+10 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+11 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-Oblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+12 0 obj
+<<
+/Type /Font
+/BaseFont /Courier-BoldOblique
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+13 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Roman
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+14 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Bold
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+15 0 obj
+<<
+/Type /Font
+/BaseFont /Times-Italic
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+16 0 obj
+<<
+/Type /Font
+/BaseFont /Times-BoldItalic
+/Subtype /Type1
+/Encoding /WinAnsiEncoding
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+17 0 obj
+<<
+/Type /Font
+/BaseFont /ZapfDingbats
+/Subtype /Type1
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+18 0 obj
+<<
+/Type /Font
+/BaseFont /Symbol
+/Subtype /Type1
+/FirstChar 32
+/LastChar 255
+>>
+endobj
+2 0 obj
+<<
+/ProcSet [/PDF /Text /ImageB /ImageC /ImageI]
+/Font <<
+/F1 5 0 R
+/F2 6 0 R
+/F3 7 0 R
+/F4 8 0 R
+/F5 9 0 R
+/F6 10 0 R
+/F7 11 0 R
+/F8 12 0 R
+/F9 13 0 R
+/F10 14 0 R
+/F11 15 0 R
+/F12 16 0 R
+/F13 17 0 R
+/F14 18 0 R
+>>
+/XObject <<
+>>
+>>
+endobj
+19 0 obj
+<<
+/Producer (jsPDF 4.2.1)
+/CreationDate (D:20261018140234+05'30')
+>>
+endobj
+20 0 obj
+<<
+/Type /Catalog
+/Pages 1 0 R
+/OpenAction [3 0 R /FitH null]
+/PageLayout /OneColumn
+>>
+endobj
+xref
+0 21
+0000000000 65535 f 
+0000003365 00000 n 
+0000005182 00000 n 
+0000000015 00000 n 
+0000000120 00000 n 
+0000003422 00000 n 
+0000003547 00000 n 
+0000003677 00000 n 
+0000003810 00000 n 
+0000003947 00000 n 
+0000004070 00000 n 
+0000004199 00000 n 
+0000004331 00000 n 
+0000004467 00000 n 
+0000004595 00000 n 
+0000004722 00000 n 
+0000004851 00000 n 
+0000004984 00000 n 
+0000005086 00000 n 
+0000005430 00000 n 
+0000005516 00000 n 
+trailer
+<<
+/Size 21
+/Root 20 0 R
+/Info 19 0 R
+/ID [ <976502F4D1260BD660DA9A843750DA2C> <976502F4D1260BD660DA9A843750DA2C> ]
+>>
+startxref
+5620
+%%EOF

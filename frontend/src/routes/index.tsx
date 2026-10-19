@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowLeftRight,
@@ -52,7 +52,9 @@ import {
   defaultGraphEdges,
   defaultGraphNodes,
   mapGraphEdges,
+  mapGraphNodes,
   mapProcessResponse,
+  markTagUserConfirmed,
   metrics as demoMetrics,
   resolutionToOption,
   resolveQueue,
@@ -65,7 +67,14 @@ import {
   type Resolution,
   type WorkspaceMetrics,
 } from "@/lib/untangle-data";
-import { processPid, resolveAmbiguity, UntangleApiError } from "@/lib/untangle-api";
+import {
+  getSavedRun,
+  getSavedRunFile,
+  getCurrentUser,
+  processPid,
+  resolveAmbiguity,
+  UntangleApiError,
+} from "@/lib/untangle-api";
 import { exportDiagram } from "@/lib/diagram-export";
 
 export const Route = createFileRoute("/")({
@@ -94,9 +103,12 @@ const statusLabels: Record<AuditStatus, string> = {
   matched: "Matched",
   missing: "Missing in P&ID",
   pending: "Pending review",
+  ambiguous: "Ambiguous",
+  "user-confirmed": "User-confirmed (session)",
 };
 
-const AUTH_STORAGE_KEY = "untangle.auth.session";
+const AUTH_TOKEN_STORAGE_KEY = "untangle.auth.token";
+const LAST_RUN_STORAGE_KEY = "untangle.lastRunId";
 
 function initialsForName(name: string): string {
   return name
@@ -128,8 +140,8 @@ function Index() {
   const [queueIndex, setQueueIndex] = useState(0);
   const [resolution, setResolution] = useState<Resolution>("bridge");
   const [selectedOption, setSelectedOption] = useState<string>("");
-  const [resolvedTags, setResolvedTags] = useState<string[]>([]);
-  const [located, setLocated] = useState(false);
+  const [userConfirmedTags, setUserConfirmedTags] = useState<string[]>([]);
+  const [locatingTag, setLocatingTag] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
   const [notice, setNotice] = useState("");
   const [expanded, setExpanded] = useState<"source" | "pfd" | null>(null);
@@ -143,7 +155,23 @@ function Index() {
   const [sourcePdf, setSourcePdf] = useState<File | null>(null);
   const [sourcePdfUrl, setSourcePdfUrl] = useState<string | null>(null);
   const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authToken, setAuthToken] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
+  const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const runRequestToken = useRef(0);
+
+  const clearAuthenticatedWorkspace = useCallback(() => {
+    runRequestToken.current += 1;
+    setCurrentRunId(null);
+    setLiveConnected(false);
+    setSourcePdf(null);
+    setAuditRows(demoAuditTags);
+    setGraphNodes(defaultGraphNodes);
+    setGraphEdges(defaultGraphEdges);
+    setQueue(demoClarifications);
+    setWorkspaceMetrics(demoMetrics);
+    setUserConfirmedTags([]);
+  }, []);
 
   const updatePfdScales = useCallback((fitScale: number, autoScale: number) => {
     setPfdFitScale(fitScale);
@@ -157,35 +185,41 @@ function Index() {
   }, [notice]);
 
   useEffect(() => {
+    let cancelled = false;
     try {
-      const savedSession = localStorage.getItem(AUTH_STORAGE_KEY);
-      if (savedSession) {
-        const parsed: unknown = JSON.parse(savedSession);
-        if (
-          typeof parsed === "object" &&
-          parsed !== null &&
-          "fullName" in parsed &&
-          "email" in parsed &&
-          "role" in parsed &&
-          typeof parsed.fullName === "string" &&
-          typeof parsed.email === "string" &&
-          typeof parsed.role === "string"
-        ) {
-          setAuthUser({
-            fullName: parsed.fullName,
-            email: parsed.email,
-            role: parsed.role,
-          });
-        } else {
-          localStorage.removeItem(AUTH_STORAGE_KEY);
+      const token = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
+      if (!token) { setAuthReady(true); return; }
+      void getCurrentUser(token).then((user) => {
+        if (cancelled) return;
+        setAuthToken(token);
+        setAuthUser({ userId: user.user_id, fullName: user.full_name, email: user.email, role: user.role });
+      }).catch((error: unknown) => {
+        if (!cancelled) {
+          localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+          setAuthUser(null);
+          if (error instanceof UntangleApiError && error.status === 401) {
+            toast.error("Session expired", { description: "Sign in again to access saved runs." });
+          }
         }
-      }
+      }).finally(() => { if (!cancelled) setAuthReady(true); });
     } catch (error) {
-      console.error("Unable to restore the local UNTANGLE session.", error);
-    } finally {
+      console.error("Unable to restore the UNTANGLE session.", error);
       setAuthReady(true);
     }
+    return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    const onExpired = () => {
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+      setAuthToken(null);
+      setAuthUser(null);
+      clearAuthenticatedWorkspace();
+      toast.error("Session expired", { description: "Sign in again to continue." });
+    };
+    window.addEventListener("untangle:auth-expired", onExpired);
+    return () => window.removeEventListener("untangle:auth-expired", onExpired);
+  }, [clearAuthenticatedWorkspace]);
 
   useEffect(() => {
     if (!sourcePdf) {
@@ -198,26 +232,82 @@ function Index() {
     return () => URL.revokeObjectURL(url);
   }, [sourcePdf]);
 
+  useEffect(() => {
+    if (!authToken) return;
+    let cancelled = false;
+    const token = ++runRequestToken.current;
+    let savedRunId: string | null = null;
+    try {
+      savedRunId = localStorage.getItem(LAST_RUN_STORAGE_KEY);
+    } catch (error) {
+      console.error("Unable to read the saved UNTANGLE run ID.", error);
+    }
+    if (!savedRunId) return;
+
+    void (async () => {
+      try {
+        const response = await getSavedRun(savedRunId, authToken);
+        if (cancelled || token !== runRequestToken.current) return;
+        const mapped = mapProcessResponse(response);
+        setCurrentRunId(mapped.runId);
+        setWorkspaceMetrics(mapped.metrics);
+        setAuditRows(mapped.auditTags);
+        setGraphNodes(mapped.graphNodes);
+        setGraphEdges(mapped.graphEdges);
+        setQueue(mapped.clarifications);
+        setPdfPageCount(mapped.pdfPageCount);
+        setProjectName(mapped.pdfFilename);
+        setExcelName(mapped.excelFilename);
+        setUserConfirmedTags([]);
+        setLiveConnected(true);
+        setQueueIndex(0);
+        setResolution("bridge");
+        setSelectedOption(
+          mapped.clarifications[0]?.selectedOption ??
+            (mapped.clarifications[0]
+              ? resolutionToOption(mapped.clarifications[0], "bridge")
+              : ""),
+        );
+        if (mapped.clarifications.length) setQueueOpen(true);
+
+        try {
+          const pdf = await getSavedRunFile(mapped.runId, "pdf", authToken);
+          if (!cancelled && token === runRequestToken.current) {
+            setSourcePdf(new File([pdf], mapped.pdfFilename, { type: "application/pdf" }));
+          }
+        } catch (error) {
+          console.error("Saved run was restored, but its source PDF could not be loaded.", error);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Unable to restore the last saved UNTANGLE run.", error);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken]);
+
   const active = hovered ?? selected;
   const current = queue[queueIndex];
   const activeOption = selectedOption || (current ? resolutionToOption(current, resolution) : "");
 
   const tags = useMemo(
     () =>
-      auditRows.map((tag) => ({
-        ...tag,
-        status:
-          resolvedTags.includes(tag.tag) || (tag.tag === "LT-309" && located)
-            ? ("matched" as const)
-            : tag.status,
-        bounds: tag.tag === "LT-309" && located ? "[504, 126, 565, 277]" : tag.bounds,
-      })),
-    [auditRows, located, resolvedTags],
+      userConfirmedTags.reduce(
+        (rows, tagName) => markTagUserConfirmed(rows, tagName),
+        auditRows,
+      ),
+    [auditRows, userConfirmedTags],
   );
 
   const matchedCount = tags.filter((t) => t.status === "matched").length;
   const missingCount = tags.filter((t) => t.status === "missing").length;
   const pendingCount = tags.filter((t) => t.status === "pending").length;
+  const ambiguousCount = tags.filter((t) => t.status === "ambiguous").length;
+  const userConfirmedCount = tags.filter((t) => t.status === "user-confirmed").length;
   const completeness =
     workspaceMetrics.total > 0
       ? ((workspaceMetrics.matched / workspaceMetrics.total) * 100).toFixed(1)
@@ -235,7 +325,7 @@ function Index() {
 
   const handleLogout = () => {
     try {
-      localStorage.removeItem(AUTH_STORAGE_KEY);
+      localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
     } catch (error) {
       console.error("Unable to clear the local UNTANGLE session.", error);
       toast.error("Could not clear saved session", {
@@ -244,6 +334,8 @@ function Index() {
       });
     }
     setAuthUser(null);
+    setAuthToken(null);
+    clearAuthenticatedWorkspace();
     toast.success("Signed out");
   };
 
@@ -261,10 +353,18 @@ function Index() {
   };
 
   const handleProcess = async (pdf: File, excel: File) => {
+    runRequestToken.current += 1;
     setProcessing(true);
     try {
-      const response = await processPid(pdf, excel);
+      if (!authToken) throw new Error("Sign in to process a drawing.");
+      const response = await processPid(pdf, excel, authToken);
       const mapped = mapProcessResponse(response);
+      setCurrentRunId(mapped.runId);
+      try {
+        localStorage.setItem(LAST_RUN_STORAGE_KEY, mapped.runId);
+      } catch (error) {
+        console.error("Unable to remember the last saved run in this browser.", error);
+      }
       setSourcePdf(pdf);
       setWorkspaceMetrics(mapped.metrics);
       setAuditRows(mapped.auditTags);
@@ -274,8 +374,8 @@ function Index() {
       setPdfPageCount(mapped.pdfPageCount);
       setProjectName(pdf.name);
       setExcelName(excel.name);
-      setResolvedTags([]);
-      setLocated(false);
+      setUserConfirmedTags([]);
+      setLocatingTag(null);
       setPfdZoom("auto");
       setLiveConnected(true);
       setQueueIndex(0);
@@ -295,12 +395,22 @@ function Index() {
     }
   };
 
+  const confirmLocatedTag = (tagName: string) => {
+    setAuditRows((rows) => markTagUserConfirmed(rows, tagName));
+    setUserConfirmedTags((tags) =>
+      (tags.includes(tagName) ? tags : [...tags, tagName]),
+    );
+    setLocatingTag(null);
+    setLocating(false);
+    notify(
+      `${tagName} marked user-confirmed for this session. Backend detection status is unchanged.`,
+    );
+  };
+
   const selectSource = (id: EquipmentId) => {
     setSelected(id);
-    if (locating) {
-      setLocated(true);
-      setLocating(false);
-      notify("LT-309 located on source drawing. Manual match recorded for this session.");
+    if (locatingTag && !sourcePdfUrl) {
+      confirmLocatedTag(locatingTag);
     }
   };
 
@@ -317,8 +427,11 @@ function Index() {
     setResolving(true);
     try {
       if (liveConnected) {
-        const result = await resolveAmbiguity(current.id, option);
+        if (!currentRunId) throw new Error("The saved run ID is unavailable.");
+        if (!authToken) throw new Error("Sign in to resolve clarifications.");
+        const result = await resolveAmbiguity(currentRunId, current.id, option, authToken);
         const integrityMatch = result.kpis.graph_integrity.match(/(\d+)\s*%/);
+        setGraphNodes(mapGraphNodes(result.nodes));
         setGraphEdges(mapGraphEdges(result.edges));
         setWorkspaceMetrics((prev) => ({
           ...prev,
@@ -344,9 +457,6 @@ function Index() {
       }
 
       const next = resolveQueue(queue, current.id, option);
-      if (!/unresolved|flagged|not sure/i.test(option)) {
-        setResolvedTags((prev) => [...prev, current.tag]);
-      }
       setQueue(next);
       setQueueIndex(0);
       setResolution("bridge");
@@ -394,7 +504,7 @@ function Index() {
             <th>TAG NAME</th>
             <th>TYPE</th>
             <th>SOURCE BOUNDING BOX</th>
-            <th>EXCEL ROW MATCH</th>
+            <th>EXCEL ROW(S)</th>
             <th>STATUS</th>
             <th className="action-heading">ACTION</th>
           </tr>
@@ -415,7 +525,9 @@ function Index() {
               <td>
                 <span className="row-match">
                   <FileText size={12} />
-                  Row #{tag.row}
+                  {tag.excelRows?.length
+                    ? `${tag.excelRows.length > 1 ? "Rows" : "Row"} ${tag.excelRows.map((row, index) => `${tag.excelSheets?.[index] ? `${tag.excelSheets[index]} ` : ""}#${row}`).join(", ")}`
+                    : "Not in Excel"}
                 </span>
               </td>
               <td>
@@ -441,7 +553,8 @@ function Index() {
                       setSelected(tag.equipment);
                       setBoxes(true);
                       if (tag.status === "missing") {
-                        setLocating(true);
+                        setLocatingTag(tag.tag);
+                        setLocating(!sourcePdfUrl);
                         notify(`Select a region on the source drawing to locate ${tag.tag}.`);
                       }
                     }
@@ -449,9 +562,13 @@ function Index() {
                 >
                   {tag.status === "matched"
                     ? "View source"
-                    : tag.status === "missing"
-                      ? "Locate manually"
-                      : "Resolve"}
+                    : tag.status === "user-confirmed"
+                      ? "User-confirmed"
+                      : tag.status === "missing"
+                        ? "Locate manually"
+                        : tag.status === "ambiguous"
+                          ? "Review source"
+                          : "Resolve"}
                   <ArrowRight size={13} />
                 </Button>
               </td>
@@ -700,21 +817,21 @@ function Index() {
               <span className="metric-qualifier">Seconds</span>
               <span className="speed-badge">
                 <Zap size={11} />
-                Fast
+                Measured
               </span>
             </div>
             <div className="pipeline-label">
-              Spatial Tiling <ChevronRight size={10} />
-              YOLOv11
+              PDF text <ChevronRight size={10} />
+              Vector evidence
               <ChevronRight size={10} />
-              PaddleOCR
+              Excel reconciliation
             </div>
             <div className="metric-foot">
               <span>
-                <Zap size={11} />
-                TensorRT accelerated
+                <ShieldCheck size={11} />
+                Local evidence pipeline
               </span>
-              <span className="success-text">&lt;3s / sheet</span>
+              <span>No OCR for image-only PDFs</span>
             </div>
           </div>
         </section>
@@ -840,7 +957,26 @@ function Index() {
                     size="icon"
                     variant="ghost"
                     aria-label="Cancel locating"
-                    onClick={() => setLocating(false)}
+                    onClick={() => {
+                      setLocating(false);
+                      setLocatingTag(null);
+                    }}
+                  >
+                    <X />
+                  </Button>
+                </div>
+              )}
+              {locatingTag && sourcePdfUrl && (
+                <div className="locating-banner" role="status">
+                  After checking the uploaded PDF, confirm {locatingTag} manually.
+                  <Button size="sm" onClick={() => confirmLocatedTag(locatingTag)}>
+                    Confirm manually
+                  </Button>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    aria-label="Cancel locating"
+                    onClick={() => setLocatingTag(null)}
                   >
                     <X />
                   </Button>
@@ -856,7 +992,9 @@ function Index() {
               </span>
               <span>
                 <Crosshair size={12} />
-                {active ? `${active} selected` : `${matchedCount} detected regions`}
+                {active
+                  ? `${active} selected`
+                  : `${matchedCount} detected regions · ${userConfirmedCount} user-confirmed`}
               </span>
             </div>
           </div>
@@ -958,6 +1096,7 @@ function Index() {
                   topology={view === "topology"}
                   nodes={graphNodes}
                   edges={graphEdges}
+                  sourceTags={liveConnected ? tags : []}
                   zoom={pfdZoom}
                   onLayoutScaleChange={updatePfdScales}
                 />
@@ -1030,7 +1169,9 @@ function Index() {
             >
               <ShieldCheck size={17} />
               <h2>Tag check & completeness audit</h2>
-              <span className="audit-record-count">{workspaceMetrics.total} tags</span>
+              <span className="audit-record-count">
+                {workspaceMetrics.total} unique inventory tags · {tags.length} audit rows
+              </span>
               {auditOpen ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
             </Button>
             <div className="audit-summary">
@@ -1044,8 +1185,19 @@ function Index() {
               </span>
               <span>
                 <span className="status-dot pending" />
-                {queue.length} pending
+                {pendingCount} pending review
               </span>
+              <span>{ambiguousCount} ambiguous</span>
+              <span>{userConfirmedCount} user-confirmed</span>
+              <span>
+                {workspaceMetrics.inventoryRows ?? workspaceMetrics.total} Excel rows ·{" "}
+                {workspaceMetrics.usableInventoryRows ?? workspaceMetrics.total} tagged
+              </span>
+              <span>
+                {workspaceMetrics.detectedSourceTags ?? matchedCount} detected in PDF ·{" "}
+                {workspaceMetrics.duplicateInventoryTags ?? 0} duplicate inventory tags
+              </span>
+              <span>{queue.length} clarification items</span>
             </div>
           </div>
           {auditOpen && (
@@ -1056,7 +1208,13 @@ function Index() {
                     { id: "all", label: "All tags", count: String(tags.length) },
                     { id: "matched", label: "Matched", count: String(matchedCount) },
                     { id: "missing", label: "Missing", count: String(missingCount) },
+                    { id: "ambiguous", label: "Ambiguous", count: String(ambiguousCount) },
                     { id: "pending", label: "Pending review", count: String(pendingCount) },
+                    {
+                      id: "user-confirmed",
+                      label: "User-confirmed",
+                      count: String(userConfirmedCount),
+                    },
                   ].map((f) => (
                     <Button
                       key={f.id}
@@ -1102,11 +1260,11 @@ function Index() {
             <span className="status-dot matched" />
             Pipeline {liveConnected ? "live" : "demo"}
             <span className="footer-separator">/</span>
-            <span>FastAPI + YOLOv11 + PaddleOCR + D3.js</span>
+            <span>FastAPI + PyMuPDF + source geometry</span>
           </span>
           <span>
             <Zap size={12} />
-            TensorRT active
+            OCR unavailable for image-only PDFs
             <span className="footer-separator">/</span>
             <span>UNTANGLE ENGINE v1.0</span>
             <CircleHelp size={14} />
@@ -1148,7 +1306,19 @@ function Index() {
           </DialogDescription>
           {current ? (
             <>
-              <IntersectionCrop resolution={activeOption || resolution} />
+              {current.evidenceCropDataUri ? (
+                <figure className="clarification-source-evidence">
+                  <img
+                    src={current.evidenceCropDataUri}
+                    alt={`Source PDF crop around process crossing on page ${(current.sourcePage ?? 0) + 1}`}
+                  />
+                  <figcaption>
+                    Source PDF evidence · page {(current.sourcePage ?? 0) + 1}
+                  </figcaption>
+                </figure>
+              ) : (
+                <IntersectionCrop resolution={activeOption || resolution} />
+              )}
               <div className="intersection-meta">
                 <span className="mono">ITEM {current.id}</span>
                 <span>
@@ -1183,7 +1353,9 @@ function Index() {
                         <span>{option}</span>
                         <small>
                           {option === current.defaultRecommendation
-                            ? `Recommended · ${current.confidence}% confidence`
+                            ? current.confidence != null
+                              ? `Recommended · ${current.confidence}% confidence`
+                              : "Review source evidence before applying"
                             : value === "unresolved"
                               ? "Retain in the clarification queue"
                               : "Apply to graph topology"}
@@ -1234,7 +1406,15 @@ function Index() {
           )}
         </DialogContent>
       </Dialog>
-      <AuthModal open={authReady && !authUser} onAuthenticated={setAuthUser} />
+      <AuthModal open={authReady && !authUser} onAuthenticated={(user, token) => {
+        try {
+          localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+          setAuthToken(token);
+          setAuthUser(user);
+        } catch {
+          toast.error("Unable to save session", { description: "Browser storage is unavailable." });
+        }
+      }} />
     </div>
   );
 }
