@@ -9,7 +9,8 @@ FastAPI service for evidence-driven P&ID digitisation and process simplification
 | `main.py` | FastAPI app, CORS, `/api/health`, `/api/process-pid`, `/api/resolve-ambiguity` |
 | `schemas.py` | Pydantic request/response models |
 | `excel_parser.py` | pandas/openpyxl I/O tag normalisation |
-| `pdf_processor.py` | PyMuPDF text/tag/equipment extraction and vector-line evidence |
+| `pdf_processor.py` | PyMuPDF text/tag/equipment extraction and raster/vector evidence |
+| `raster_linework.py` | Conservative orthogonal raster-stroke and intersection candidates |
 | `graph_engine.py` | Source-geometry process graph and junction preservation |
 
 ## Live upload evidence
@@ -18,11 +19,49 @@ The upload endpoint only uses entities extracted from the uploaded PDF; it
 does not add the hard-coded sample entities. A tag is reported as matched only
 when its extracted PDF detection has a valid, non-empty source bounding box and
 the inventory tag is unique. Duplicate inventory tags are marked ambiguous.
-Image-only PDFs currently return an explicit error because OCR is not
-configured. The sample entities in `pdf_processor.py` are available only when
+Image-only pages use optional local OCR when Tesseract is installed. Without
+Tesseract, upload fails with an actionable error instead of returning an empty
+audit. The sample entities in `pdf_processor.py` are available only when
 `process_pdf(..., demo_mode=True)` is explicitly selected. Uploads default to
 live mode; multipart field `demo_mode=true` explicitly opts into sample entities
 and sample clarification items.
+
+Scanned pages without usable embedded tag text are rendered locally and passed
+to the Tesseract executable as TSV OCR. Pages are rendered at 6x scale and use
+Tesseract's sparse-text page segmentation mode to improve recovery of small
+drawing labels. OCR results are still subject to the same exact-tag and
+confidence checks; if no source-located labels can be verified, the upload
+fails rather than creating an empty audit. On Windows, install Tesseract with:
+
+```powershell
+winget install --id UB-Mannheim.TesseractOCR -e
+```
+
+If the installer does not add Tesseract to `PATH`, run this in the same
+PowerShell terminal used to start the backend:
+
+```powershell
+$env:Path += ";C:\Program Files\Tesseract-OCR"
+tesseract --version
+```
+
+Alternatively, add `C:\Program Files\Tesseract-OCR` to the Windows user `Path`
+environment variable and open a new terminal. Restart the backend after
+updating `PATH`. No OCR service or provider API is called. OCR detections retain
+the recognized line, page, source bounding box, and Tesseract's confidence in
+the audit response.
+Detections below 80% OCR confidence (or without a confidence value) are marked
+`Ambiguous`, not matched. This threshold is a conservative review trigger, not
+a calibrated accuracy claim. If Tesseract is unavailable, scanned uploads fail
+with the installation command rather than a successful empty audit.
+
+For raster pages, UNTANGLE also extracts horizontal and vertical dark-pixel
+runs as provisional source-coordinate candidates and reports their geometric
+intersections as unresolved. The detector does not classify a stroke as
+process, utility, or instrument signal, does not decide whether intersections
+connect, and does not feed these candidates into graph construction. Raster
+candidates are evidence for review, not reconstructed topology; vector lines
+remain the only linework currently eligible for graph generation.
 
 ## Process topology evidence
 
@@ -43,12 +82,15 @@ The source fixtures do not contain reliable flow-direction arrows. Accordingly,
 returned process edges use `flow_direction="undirected"` and the KPI reports a
 partial or unverified status instead of a percentage. A drawing without a
 classifiable process-line legend, or without reliable equipment-to-line
-associations, receives no guessed edges. Raster-only PDFs remain unsupported
-until OCR is configured.
+associations, receives no guessed edges. Raster-only pipework remains
+unsupported for topology extraction even when OCR successfully recovers labels;
+the raster candidates and unresolved intersections are shown separately and
+excluded from confirmed edges.
 
 ## Audit count semantics
 
 - `inventory_rows` counts non-header Excel data rows, including rows with an empty tag.
+- Inventory rows marked `Location=DCS`, `I/O Type=SW`, or with software/alarm/status-derived type metadata are not treated as physical drawing symbols. Rows with `Location=MCC` or `LP` and no stronger software marker stay `Pending Review` because the workbook does not establish that they should be visible on the P&ID. `FIELD`/`VALVE` rows are physical candidates. An unmatched physical row with a P&ID reference stays `Pending Review` until that drawing reference has been mapped to a processed source page; the current pipeline does not yet verify title-block-to-page mappings. An unmatched row without a P&ID reference may be labeled `Missing in P&ID` after source processing. Workbooks without a location column retain the existing tag-audit behavior.
 - `usable_inventory_rows` counts rows with a normalized, non-empty tag.
 - `unique_inventory_tags` counts distinct normalized tags and is also returned as the legacy `total_tags` value used for completeness.
 - `duplicate_inventory_tags` counts distinct tags repeated in Excel; `duplicate_inventory_rows` counts extra occurrences beyond the first.
@@ -57,12 +99,15 @@ until OCR is configured.
 - Duplicate inventory tags are grouped into one audit row with all originating Excel row numbers and status `Ambiguous`; a single PDF detection is never counted as multiple matches. Both the duplicate tag group count and repeated row count are reported separately.
 - PDF-only detections appear once as `Ambiguous` audit rows. They contribute to `audit_rows` and `pdf_only_tags`, but not to inventory status counts or `unique_inventory_tags`.
 - `clarification_items` counts only the clarification queue for that run. Fixed sample clarifications are returned only when multipart field `demo_mode=true` is explicitly supplied; live uploads default to no sample clarifications.
+- `deferred_clarification_items` counts additional source-supported ambiguities beyond the three-item review limit. These remain provisional in graph evidence and are not counted as resolved.
 
-Clarification choices are recorded against their processing run. Source-supported
-line-crossing clarifications reprocess the saved PDF and regenerate the graph
-for the selected junction or crossover interpretation. Other clarification
-items without a graph-resolution contract are rejected. An unresolved choice is
-saved as unresolved and can be revisited; only a listed option can be recorded.
+Clarification choices are recorded against their processing run. The queue
+prioritizes source-supported crossings, followed by nozzle ambiguities, and
+returns at most three questions. Any additional source-supported ambiguities
+remain provisional and are counted in `deferred_clarification_items`; they are
+not silently resolved. Crossing/nozzle choices reprocess the saved PDF and
+regenerate the graph. An unresolved choice is saved as unresolved and can be
+revisited; only a listed option can be recorded.
 
 ## Persistent local runs
 
@@ -84,9 +129,17 @@ decisions scoped by `(run_id, item_id)`. The data directory is ignored by Git.
 - `POST /api/resolve-ambiguity` now requires `run_id` as well as `item_id` and
   `selected_option`, so a choice is never applied to another run.
 
-Authentication is intended for a trusted local demo, not a public deployment.
-SQLite persistence does not add OCR: scanned PDFs remain unsupported, and graph
-flow direction/topology can remain unverified.
+Authentication uses bearer tokens and owner-scoped run queries. Accounts can
+register at `POST /api/auth/register`; registration requires a valid email, a
+name, and a password with at least 12 non-whitespace characters. Passwords are
+stored as salted PBKDF2-HMAC-SHA256 hashes. Review rate limiting and operational
+controls before exposing the service publicly.
+
+SQLite persistence is independent of OCR. Image-based label extraction requires
+the optional local Tesseract executable described above; raster pipe topology
+and flow direction can still remain unverified. Configure
+`UNTANGLE_CORS_ORIGINS` as a comma-separated list of exact frontend origins for
+deployment; the localhost development origins are used when it is unset.
 
 ## Local demo authentication
 
@@ -95,7 +148,7 @@ salted PBKDF2-HMAC-SHA256 password hash, never the password. Set
 `UNTANGLE_DEMO_EMAIL` and `UNTANGLE_DEMO_PASSWORD` before the first backend
 start to choose different local demo credentials. These defaults are for a
 controlled hackathon demo only; use a unique password on any shared machine.
-There is no public registration endpoint.
+The frontend also supports self-service account registration.
 
 `POST /api/auth/login` returns a signed bearer token expiring after 12 hours.
 The signing key is randomly generated once and stored in the configured SQLite
@@ -180,21 +233,34 @@ The Hugging Face adapter uses its OpenAI-compatible chat endpoint at
 
 ## Setup
 
-```bash
-cd backend
+```powershell
+cd untangled_backend
+Copy-Item .env.example .env
+# Edit .env and replace UNTANGLE_DEMO_PASSWORD with a unique local password.
 python -m pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API docs: http://localhost:8000/docs
 
+The default demo account is seeded only if it does not exist yet. When using
+the example environment file, sign in with its configured
+`UNTANGLE_DEMO_EMAIL` and `UNTANGLE_DEMO_PASSWORD`. New users can create an
+account in the frontend; account creation signs them in immediately.
+
 ## Endpoints
 
-- `GET /api/health` — service status and local PyMuPDF text/vector pipeline availability; OCR is not configured
+- `GET /api/health` — service status, PyMuPDF text/vector availability, and whether local Tesseract is installed
 - `POST /api/auth/login` — JSON `{ "email", "password" }` → signed bearer session
+- `POST /api/auth/register` — JSON `{ "email", "password", "full_name" }` → creates an account and signed bearer session
 - `GET /api/auth/me` — validate bearer session and return its user
 - `POST /api/process-pid` — multipart `file_pdf` + `file_excel` → `ProcessPidResponse`
 - `POST /api/resolve-ambiguity` — JSON `{ "run_id", "item_id", "selected_option" }` → updated KPIs/edges
 - `GET /api/runs` — recent saved-run summaries
 - `GET /api/runs/{run_id}` — full saved processing result
 - `GET /api/runs/{run_id}/files/{pdf|excel}` — original uploaded file for a saved run
+
+`ProcessPidResponse` includes source-coordinate `raster_line_candidates` and
+`raster_intersection_candidates` for scanned pages. These are provisional
+evidence and are not graph edges; the matching KPI fields report only their
+counts.

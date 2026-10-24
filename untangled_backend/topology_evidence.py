@@ -63,8 +63,6 @@ def find_equipment_nozzle_endpoints(
             start, end = segment["start"], segment["end"]
             horizontal = abs(start[1] - end[1]) <= tolerance
             vertical = abs(start[0] - end[0]) <= tolerance
-            if not (horizontal or vertical):
-                continue
             for endpoint_index, (point, other) in enumerate(((start, end), (end, start))):
                 endpoint_matches = []
                 for node in equipment:
@@ -91,12 +89,57 @@ def find_equipment_nozzle_endpoints(
                     )
                     center_x, center_y = (x1 + x2) / 2, (y1 + y2) / 2
                     nozzle_options = []
+                    point_inside = x1 <= point[0] <= x2 and y1 <= point[1] <= y2
+                    other_inside = x1 <= other[0] <= x2 and y1 <= other[1] <= y2
+                    if not other_inside:
+                        dx, dy = point[0] - other[0], point[1] - other[1]
+                        entry = -math.inf
+                        exit = math.inf
+                        for origin, delta, minimum, maximum in (
+                            (other[0], dx, x1, x2),
+                            (other[1], dy, y1, y2),
+                        ):
+                            if abs(delta) <= 1e-9:
+                                if origin < minimum or origin > maximum:
+                                    entry, exit = math.inf, -math.inf
+                                    break
+                                continue
+                            first = (minimum - origin) / delta
+                            second = (maximum - origin) / delta
+                            entry = max(entry, min(first, second))
+                            exit = min(exit, max(first, second))
+                        enters_at_endpoint = point_inside and entry <= 1.0 <= exit
+                        enters_after_endpoint = not point_inside and entry >= 1.0
+                        if (
+                            entry <= exit
+                            and (enters_at_endpoint or enters_after_endpoint)
+                        ):
+                            boundary = (other[0] + entry * dx, other[1] + entry * dy)
+                            nozzle_options.append(
+                                (math.dist(point, boundary), boundary)
+                            )
                     if horizontal and abs(point[1] - center_y) <= alignment_tolerance:
+                        if x1 <= point[0] <= x2 and other[0] < point[0]:
+                            nozzle_options.append(
+                                (point[0] - x1, (x1, center_y))
+                            )
+                        if x1 <= point[0] <= x2 and other[0] > point[0]:
+                            nozzle_options.append(
+                                (x2 - point[0], (x2, center_y))
+                            )
                         if point[0] <= x1 and other[0] <= point[0] + tolerance:
                             nozzle_options.append((x1 - point[0], (x1, center_y)))
                         if point[0] >= x2 and other[0] >= point[0] - tolerance:
                             nozzle_options.append((point[0] - x2, (x2, center_y)))
                     if vertical and abs(point[0] - center_x) <= alignment_tolerance:
+                        if y1 <= point[1] <= y2 and other[1] < point[1]:
+                            nozzle_options.append(
+                                (point[1] - y1, (center_x, y1))
+                            )
+                        if y1 <= point[1] <= y2 and other[1] > point[1]:
+                            nozzle_options.append(
+                                (y2 - point[1], (center_x, y2))
+                            )
                         if point[1] <= y1 and other[1] <= point[1] + tolerance:
                             nozzle_options.append((y1 - point[1], (center_x, y1)))
                         if point[1] >= y2 and other[1] >= point[1] - tolerance:

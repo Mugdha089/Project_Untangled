@@ -66,24 +66,25 @@ model from scratch on day one.
 
 ## Recommended differentiator
 
-**Evidence-linked simplification with a completeness and connection
-audit.**
+**Evidence-linked, topology-preserving simplification with selective human verification.**
 
-Every output object should be traceable to evidence in the source: a
-tag, a detected symbol, a line segment, a matched Excel row, or a
-clearly marked inference. The system should flag uncertain connections
-instead of silently inventing them. The output should include a compact
-validation panel showing tag coverage, unmatched tags, major equipment
-retained, and connection checks. For localized ambiguities that remain
-important and cannot be resolved automatically, use a brief pre-render
-clarification step; it must reduce uncertainty without shifting the main
-interpretation workload to the user.
+Every output object is strictly traceable to evidence in the source: a tag, a detected symbol, a line segment, a matched Excel row, or a clearly marked inference. The system flags uncertain connections instead of silently inventing them. The output includes a compact validation panel showing tag coverage, unmatched tags, major equipment retained, and connection checks. For localized ambiguities that remain important and cannot be resolved automatically, UNTANGLE provides a pre-render clarification queue that presents high-resolution source crops with targeted multi-choice questions (e.g. crossing vs. tee junction, nozzle attachment), updating the underlying NetworkX graph deterministically.
 
-This is a credible product direction, not a claim that graph-based P&ID
-extraction or traceability has never been done before. Published work
-already covers symbol/text/line extraction, graph reconstruction, and
-P&ID digitisation. Our contribution must be demonstrated through a
-specific workflow, algorithmic improvement, evaluation, or user outcome.
+### Sourced Literature Findings & Industrial Digitisation Practices
+
+Established research in P&ID digitization documents clear technical trade-offs:
+1. **Multi-Stage Decomposition (Mani et al., 2020; Microsoft ISE):** Industrial pipelines separate symbol detection (YOLO/Faster-R-CNN), text detection/OCR, and linework tracing (morphological thinning, Hough transforms, vectorization). Monolithic end-to-end models struggle with the extreme density and heterogeneous scales of engineering diagrams.
+2. **Line Discontinuity & Intersections (Paliwal et al., 2021; Kang et al., 2022):** Classical line-tracing algorithms consistently break when process pipes pass behind equipment symbols or text callouts, leading to fragmented graphs. Conversely, heuristic gap-closing often joins unrelated parallel lines.
+3. **Silent Graph Hallucinations (Stürmer et al., 2024; Multimodal LLMs):** Unconstrained neural approaches frequently hallucinate connections across disconnected lines or fail to preserve crucial recycle loops, making them unsafe for process engineering without strict geometric validation.
+
+### Actual Limitations in Real Plant Datasets (Emerson Track 1 Findings)
+
+1. **Scanned Raster PDFs:** Industrial drawings such as the official `Sample P&IDs_Sanitized 1.pdf` (4 pages, 1067×748 px) contain zero extractable text or vector linework. Direct text extractors fail; high-accuracy OCR and raster vectorization are strictly required.
+2. **DCS Software Records vs. Physical Drawings:** In the official Track 1 inventory (`UNTANGLE_03_Filtered_IO_Records 1.xlsx`), 172 out of 271 records are DCS software-derived tags (Location: DCS, I/O Type: SW, Signal Type: `-`, internal alarms and logic blocks). These do not and should not appear as standalone physical piping symbols on P&IDs. Classifying them as "Missing in P&ID" is an engineering defect; UNTANGLE classifies them as "Pending Review" with explicit source notes.
+3. **Planar Line Crossing Ambiguities:** Without explicit 3D elevation or bridge/jump-arc symbols, planar 4-way crossings cannot be safely disambiguated by geometry alone. UNTANGLE surfaces these as localized visual clarification items with source crops rather than guessing flow paths.
+4. **Nozzle Attachment Gaps:** Linework frequently stops 2–10 pt short of equipment boundaries. UNTANGLE distinguishes verified connections from provisional nozzle alignments and requires user confirmation for ambiguous nozzles.
+
+This is a credible, defensible engineering solution that preserves the integrity of safety-critical process flows rather than presenting an unverified cosmetic sketch.
 
 ------------------------------------------------------------------------
 

@@ -19,6 +19,9 @@ export interface AuditTag {
   excelSheets?: (string | null)[];
   status: AuditStatus;
   equipment: EquipmentId | null;
+  rawText?: string;
+  ocrConfidence?: number;
+  reason?: string;
 }
 
 export interface WorkspaceMetrics {
@@ -31,6 +34,9 @@ export interface WorkspaceMetrics {
   missing?: number;
   ambiguous?: number;
   clarificationItems?: number;
+  deferredClarificationItems?: number;
+  rasterLineCandidates?: number;
+  rasterIntersectionCandidates?: number;
   auditRows?: number;
   pendingReviewTags?: number;
   retained: number;
@@ -209,6 +215,9 @@ export function mapKpis(kpis: BackendKpiSummary): WorkspaceMetrics {
     missing: kpis.missing_tags ?? Math.max(0, kpis.total_tags - kpis.matched_tags),
     ambiguous: kpis.ambiguous_tags ?? 0,
     clarificationItems: kpis.clarification_items ?? 0,
+    deferredClarificationItems: kpis.deferred_clarification_items ?? 0,
+    rasterLineCandidates: kpis.raster_line_candidates ?? 0,
+    rasterIntersectionCandidates: kpis.raster_intersection_candidates ?? 0,
     auditRows: kpis.audit_rows ?? kpis.total_tags,
     pendingReviewTags: kpis.pending_review_tags ?? 0,
     retained: kpis.retained_equipment,
@@ -235,8 +244,31 @@ export function mapAuditTags(
       excelSheets: row.excel_sheets ?? (row.excel_sheet ? [row.excel_sheet] : []),
       status,
       equipment: inferEquipmentForTag(row, nodes),
+      ...(row.raw_text != null ? { rawText: row.raw_text } : {}),
+      ...(row.ocr_confidence != null ? { ocrConfidence: row.ocr_confidence } : {}),
+      ...(row.reason ? { reason: explainAuditReason(row.reason) } : {}),
     };
   });
+}
+
+function explainAuditReason(reason: string): string {
+  const explanations: Record<string, string> = {
+    software_derived_record: "Software-derived record; not a physical P&ID symbol.",
+    source_visibility_unverified:
+      "Workbook metadata does not establish that this record should appear as a physical symbol.",
+    source_page_mapping_unverified:
+      "The workbook P&ID reference is not mapped to a verified source page; missing status is deferred.",
+    no_valid_source_detection: "No valid source-located tag detection was found.",
+    duplicate_inventory_tag:
+      "Duplicate Excel rows: one PDF detection cannot confirm multiple inventory rows.",
+    low_ocr_confidence:
+      "OCR confidence is below the review threshold; verify the source crop.",
+    duplicate_source_detection:
+      "Repeated source detections are ambiguous; review the OCR evidence.",
+    ambiguous_pdf_detection: "The source reading is ambiguous and needs review.",
+    unmatched_pdf_detection: "Detected PDF tag is not present in the Excel inventory.",
+  };
+  return explanations[reason] ?? reason.replaceAll("_", " ");
 }
 
 export function mapGraphNodes(nodes: BackendEquipmentNode[]): GraphNodeView[] {

@@ -33,8 +33,40 @@ TYPE_HEADER_CANDIDATES: Tuple[str, ...] = (
     "signal type",
 )
 
+LOCATION_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "location",
+    "tag location",
+    "loc",
+)
+
+IO_TYPE_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "i/o type name",
+    "io type name",
+    "i/o type",
+    "io type",
+    "io_type",
+)
+
+SIGNAL_TYPE_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "signal type",
+    "signal",
+)
+
+SYSTEM_TYPE_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "system type",
+    "system",
+)
+
+PID_HEADER_CANDIDATES: Tuple[str, ...] = (
+    "pid",
+    "p&id",
+    "p&id reference",
+    "drawing",
+    "dwg",
+)
+
 TAG_PATTERN = re.compile(
-    r"^[A-Z]{1,4}-?\d{1,4}(?:-\d{2,4})?[A-Z]?$",
+    r"^(?:\d{1,4}-)?[A-Z]{1,4}-?\d{1,4}(?:-\d{2,4})?[A-Z]?$",
     re.IGNORECASE,
 )
 
@@ -60,6 +92,13 @@ def _normalize_tag(value: Any) -> str:
     )
     if match:
         return f"{match.group(1)}-{match.group(2)}"
+    # Canonicalise unit-prefixed tags: e.g. 631-FIT-3718 or 631-AY-3054
+    unit_match = re.match(
+        r"^(\d{1,4})[-_]?([A-Z]{1,4})[-_]?(\d{1,4}(?:-\d{2,4})?[A-Z]?)$",
+        text,
+    )
+    if unit_match:
+        return f"{unit_match.group(1)}-{unit_match.group(2)}-{unit_match.group(3)}"
     return text
 
 
@@ -124,7 +163,53 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
         except Exception:
             buffer.seek(0)
             workbook = pd.ExcelFile(buffer)
-        sheet_name = workbook.sheet_names[0]
+
+        # Select best sheet for I/O tags:
+        preferred_names = (
+            "filtered io",
+            "filtered_io",
+            "filteredio",
+            "io list",
+            "i/o list",
+            "iolist",
+            "instrument tag list",
+            "instrument list",
+            "tags",
+            "tag list",
+            "io",
+            "i/o",
+        )
+        sheet_candidates = [
+            name for name in workbook.sheet_names
+            if not (len(workbook.sheet_names) > 1 and _normalize_header(name) in ("legend", "summary"))
+        ]
+        chosen_sheet = None
+        for pref in preferred_names:
+            for s in sheet_candidates:
+                if _normalize_header(s) == pref:
+                    chosen_sheet = s
+                    break
+            if chosen_sheet:
+                break
+
+        if chosen_sheet is None:
+            best_sheet = None
+            max_rows = -1
+            for s in sheet_candidates:
+                try:
+                    candidate_df = pd.read_excel(workbook, sheet_name=s, dtype=object)
+                    if candidate_df.empty:
+                        continue
+                    cols = [str(c) for c in candidate_df.columns.tolist()]
+                    t_col = _find_column(cols, TAG_HEADER_CANDIDATES)
+                    if t_col is not None and len(candidate_df) > max_rows:
+                        best_sheet = s
+                        max_rows = len(candidate_df)
+                except Exception:
+                    continue
+            chosen_sheet = best_sheet or (sheet_candidates[0] if sheet_candidates else workbook.sheet_names[0])
+
+        sheet_name = chosen_sheet
         df = pd.read_excel(workbook, sheet_name=sheet_name, dtype=object)
     except Exception as exc:
         logger.exception("Failed to read Excel file '%s'", filename)
@@ -136,6 +221,11 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
     columns = [str(c) for c in df.columns.tolist()]
     tag_column = _find_column(columns, TAG_HEADER_CANDIDATES)
     type_column = _find_column(columns, TYPE_HEADER_CANDIDATES)
+    location_column = _find_column(columns, LOCATION_HEADER_CANDIDATES)
+    io_type_column = _find_column(columns, IO_TYPE_HEADER_CANDIDATES)
+    signal_type_column = _find_column(columns, SIGNAL_TYPE_HEADER_CANDIDATES)
+    system_type_column = _find_column(columns, SYSTEM_TYPE_HEADER_CANDIDATES)
+    pid_column = _find_column(columns, PID_HEADER_CANDIDATES)
 
     if tag_column is None:
         # Heuristic: pick the first column whose values look like tags.
@@ -182,6 +272,24 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
 
         instrument_type = raw_type or _infer_tag_type(tag)
 
+        location_val = str(row.get(location_column, "")).strip() if location_column and row.get(location_column) is not None and not (isinstance(row.get(location_column), float) and pd.isna(row.get(location_column))) else ""
+        io_type_val = str(row.get(io_type_column, "")).strip() if io_type_column and row.get(io_type_column) is not None and not (isinstance(row.get(io_type_column), float) and pd.isna(row.get(io_type_column))) else ""
+        signal_type_val = str(row.get(signal_type_column, "")).strip() if signal_type_column and row.get(signal_type_column) is not None and not (isinstance(row.get(signal_type_column), float) and pd.isna(row.get(signal_type_column))) else ""
+        system_type_val = str(row.get(system_type_column, "")).strip() if system_type_column and row.get(system_type_column) is not None and not (isinstance(row.get(system_type_column), float) and pd.isna(row.get(system_type_column))) else ""
+        pid_val = str(row.get(pid_column, "")).strip() if pid_column and row.get(pid_column) is not None and not (isinstance(row.get(pid_column), float) and pd.isna(row.get(pid_column))) else ""
+
+        is_software_derived = (
+            location_val.upper() == "DCS"
+            or io_type_val.upper() in ("SW", "SOFTWARE")
+            or any(kw in (instrument_type or "").upper() for kw in ("STATUS INDICATION", "ALARM", "CALCULATED", "SOFTWARE"))
+        )
+        if is_software_derived:
+            source_visibility = "software_derived"
+        elif location_column is not None and location_val.upper() in {"MCC", "LP"}:
+            source_visibility = "scope_review"
+        else:
+            source_visibility = "physical_candidate"
+
         if tag in seen:
             duplicates.append(tag)
             status_note = "duplicate"
@@ -195,7 +303,15 @@ def load_excel_tags(file_bytes: bytes, filename: str = "io_list.xlsx") -> Dict[s
                 "original_tag": str(raw_tag).strip() if raw_tag is not None else tag,
                 "type": instrument_type,
                 "excel_row": excel_row,
+                "excel_sheet": sheet_name,
                 "status_note": status_note,
+                "location": location_val,
+                "io_type": io_type_val,
+                "signal_type": signal_type_val,
+                "system_type": system_type_val,
+                "pid_ref": pid_val,
+                "is_software_derived": is_software_derived,
+                "source_visibility": source_visibility,
             }
         )
 

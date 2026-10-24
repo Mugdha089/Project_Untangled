@@ -260,30 +260,58 @@ def record_decision(
     result: dict[str, Any],
     owner_id: str,
 ) -> None:
-    """Atomically persist one decision and the updated run result."""
+    """Atomically persist a decision and the updated run result."""
+    record_decisions(
+        run_id,
+        [(item_id, selected_option, status)],
+        result,
+        owner_id,
+    )
+
+
+def record_decisions(
+    run_id: str,
+    decisions: list[tuple[str, str, str]],
+    result: dict[str, Any],
+    owner_id: str,
+) -> None:
+    """Persist a batch of clarification decisions and the run result atomically."""
+    item_ids = [item_id for item_id, _, _ in decisions]
+    if len(set(item_ids)) != len(item_ids):
+        raise ValueError("A clarification item can be answered only once per batch.")
     serialized = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
     now = datetime.now(timezone.utc).isoformat()
     with _connection() as connection:
-        existing = connection.execute(
-            """SELECT d.status FROM clarification_decisions d
-               JOIN processing_runs r ON r.run_id=d.run_id
-               WHERE d.run_id = ? AND d.item_id = ? AND r.owner_id = ?""",
-            (run_id, item_id, owner_id),
+        run = connection.execute(
+            "SELECT 1 FROM processing_runs WHERE run_id = ? AND owner_id = ?",
+            (run_id, owner_id),
         ).fetchone()
-        if existing is None:
-            run_exists = connection.execute(
-                "SELECT 1 FROM processing_runs WHERE run_id = ? AND owner_id = ?", (run_id, owner_id)
-            ).fetchone()
-            if run_exists is None:
-                raise RunNotFoundError(run_id)
-            raise ClarificationNotFoundError(item_id)
-        if existing["status"] == "resolved":
-            raise ClarificationAlreadyResolvedError(item_id)
-        connection.execute(
+        if run is None:
+            raise RunNotFoundError(run_id)
+        existing_by_id = {
+            row["item_id"]: row["status"]
+            for row in connection.execute(
+                """SELECT item_id, status FROM clarification_decisions
+                   WHERE run_id = ? AND item_id IN ({})""".format(
+                    ",".join("?" for _ in item_ids)
+                ),
+                (run_id, *item_ids),
+            )
+        } if item_ids else {}
+        for item_id, _, _ in decisions:
+            existing_status = existing_by_id.get(item_id)
+            if existing_status is None:
+                raise ClarificationNotFoundError(item_id)
+            if existing_status == "resolved":
+                raise ClarificationAlreadyResolvedError(item_id)
+        connection.executemany(
             """UPDATE clarification_decisions
                SET selected_option = ?, status = ?, updated_at = ?
                WHERE run_id = ? AND item_id = ?""",
-            (selected_option, status, now, run_id, item_id),
+            [
+                (option, status, now, run_id, item_id)
+                for item_id, option, status in decisions
+            ],
         )
         cursor = connection.execute(
             "UPDATE processing_runs SET result_json = ? WHERE run_id = ? AND owner_id = ?",

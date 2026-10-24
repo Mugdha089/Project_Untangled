@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import io
 import logging
 import math
+import os
 import re
-import base64
+import shutil
+import subprocess
+from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
 from topology_evidence import (
@@ -16,6 +21,7 @@ from topology_evidence import (
     find_ambiguous_process_crossings,
     find_equipment_nozzle_endpoints,
 )
+from raster_linework import extract_raster_linework
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +34,17 @@ except ImportError:  # pragma: no cover - optional at import time for CI stubs
         fitz = None  # type: ignore
 
 TAG_RE = re.compile(
-    r"\b([A-Z]{1,4})[-\s_]?(\d{1,4}(?:-\d{2,4})?[A-Z]?)\b",
+    r"\b((?:\d{1,4}[-\s_]+)?[A-Z]{1,4})[-\s_]?(\d{1,4}(?:-\d{2,4})?[A-Z]?)\b",
     re.IGNORECASE,
 )
 
 EQUIPMENT_RE = re.compile(
-    r"\b(FCV|TK|HX|FV|LV|XV|PV|HV|T|P|M|R|E|V|F)[-\s_]?(\d{2,4}[A-Z]?)\b",
+    r"\b((?:\d{1,4}[-\s_]+)?(?:FCV|TK|HX|FV|LV|XV|PV|HV|T|P|M|R|E|V|F))[-\s_]?(\d{2,4}[A-Z]?)\b",
     re.IGNORECASE,
 )
+OCR_RENDER_SCALE = 6.0
+OCR_MIN_CONFIDENCE = 80.0
+MAX_CLARIFICATIONS_PER_RUN = 3
 INSTRUMENT_PREFIXES = {
     "PT", "FT", "LT", "TT", "PI", "FI", "LI", "TI",
     "PC", "FC", "LC", "TC", "PIC", "FIC", "LIC", "TIC",
@@ -166,12 +175,42 @@ class PdfProcessError(Exception):
     """Raised when a PDF cannot be opened or processed."""
 
 
+def find_tesseract_executable() -> Optional[str]:
+    """Find Tesseract on PATH or at its standard Windows install location."""
+    executable = shutil.which("tesseract")
+    if executable:
+        return executable
+    if os.name != "nt":
+        return None
+
+    install_roots = (
+        os.environ.get("ProgramFiles", r"C:\Program Files"),
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+    )
+    for root in install_roots:
+        candidate = os.path.join(root, "Tesseract-OCR", "tesseract.exe")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def _bbox_to_ints(bbox: Tuple[float, float, float, float]) -> List[int]:
     return [int(round(v)) for v in bbox]
 
 
 def _canonical_tag(prefix: str, number: str) -> str:
-    return f"{prefix.upper()}-{number.upper()}"
+    normalized_prefix = prefix.upper().strip()
+    unit_prefix = re.fullmatch(r"(\d{1,4})[-\s_]+([A-Z]{1,4})", normalized_prefix)
+    if unit_prefix:
+        normalized_prefix = f"{unit_prefix.group(1)}-{unit_prefix.group(2)}"
+    else:
+        normalized_prefix = re.sub(r"[\s_]+", "", normalized_prefix)
+    return f"{normalized_prefix}-{number.upper()}"
+
+
+def _prefix_without_unit(prefix: str) -> str:
+    unit_prefix = re.fullmatch(r"\d{1,4}[-\s_]+([A-Z]{1,4})", prefix, re.IGNORECASE)
+    return unit_prefix.group(1).upper() if unit_prefix else prefix.upper()
 
 
 def _extract_embedded_text(
@@ -217,11 +256,18 @@ def _extract_embedded_text(
 
                 equipment_type = None
                 equipment_match = EQUIPMENT_RE.fullmatch(text)
-                prefix = tag_match.group(1).upper()
+                prefix = _prefix_without_unit(tag_match.group(1))
                 if equipment_match is not None:
-                    prefix = equipment_match.group(1).upper()
+                    prefix = _prefix_without_unit(equipment_match.group(1))
                     equipment_type = _equipment_type_from_prefix(prefix)
-                if equipment_type is None and prefix not in INSTRUMENT_PREFIXES:
+                has_unit_prefix = bool(
+                    re.match(r"^\d{1,4}[-\s_]+", tag_match.group(1))
+                )
+                if (
+                    equipment_type is None
+                    and prefix not in INSTRUMENT_PREFIXES
+                    and not has_unit_prefix
+                ):
                     equipment_type = _equipment_type_from_context(
                         prefix,
                         bbox,
@@ -249,6 +295,7 @@ def _extract_embedded_text(
                                 ),
                                 "confidence": 0.90,
                                 "page": page_index,
+                                "raw_text": text,
                             }
                         )
                     continue
@@ -267,6 +314,7 @@ def _extract_embedded_text(
                             "confidence": 0.92,
                             "page": page_index,
                             "parent_equipment": None,
+                            "raw_text": text,
                         }
                     )
 
@@ -284,7 +332,12 @@ def _page_shape_bounds(page: Any) -> List[Tuple[float, float, float, float]]:
         if rect is None:
             continue
         x1, y1, x2, y2 = (float(value) for value in rect)
-        if 8 <= x2 - x1 <= 150 and 8 <= y2 - y1 <= 150:
+        width, height = x2 - x1, y2 - y1
+        if (
+            8 <= width <= 150
+            and 8 <= height <= 150
+            and max(width / height, height / width) <= 2.5
+        ):
             shapes.append((x1, y1, x2, y2))
     return shapes
 
@@ -323,10 +376,21 @@ def _nearest_shape_bbox(
     while True:
         expanded = []
         for shape in remaining:
-            if any(
+            overlaps_group = any(
                 max(shape[0], member[0]) <= min(shape[2], member[2])
                 and max(shape[1], member[1]) <= min(shape[3], member[3])
                 for member in group
+            )
+            group_bounds = (
+                min([shape[0], *(member[0] for member in group)]),
+                min([shape[1], *(member[1] for member in group)]),
+                max([shape[2], *(member[2] for member in group)]),
+                max([shape[3], *(member[3] for member in group)]),
+            )
+            if (
+                overlaps_group
+                and group_bounds[2] - group_bounds[0] <= 150
+                and group_bounds[3] - group_bounds[1] <= 150
             ):
                 expanded.append(shape)
         if not expanded:
@@ -405,7 +469,8 @@ def _equipment_type_from_context(
 
 
 def _infer_instrument_type(tag: str) -> str:
-    prefix = tag.split("-")[0]
+    prefix_match = re.match(r"^(?:\d{1,4}-)?([A-Z]{1,4})-", tag, re.IGNORECASE)
+    prefix = prefix_match.group(1).upper() if prefix_match else tag.split("-")[0]
     mapping = {
         "PT": "Pressure Transmitter",
         "FT": "Flow Transmitter",
@@ -424,6 +489,7 @@ def _infer_instrument_type(tag: str) -> str:
 
 
 def _equipment_type_from_prefix(prefix: str) -> Optional[str]:
+    prefix = _prefix_without_unit(prefix)
     mapping = {
         "TK": "tank",
         "T": "tank",
@@ -534,9 +600,20 @@ def _extract_drawing_evidence(doc: Any) -> Dict[str, Any]:
                 previous = legend_styles.get(key)
                 legend_styles[key] = kind if previous in (None, kind) else "ambiguous"
 
+        signal_dash_patterns = {
+            k[1]
+            for k, v in legend_styles.items()
+            if v == "instrument_signal" and k[1] not in ("", "[] 0")
+        }
+
         for drawing_index, drawing in enumerate(drawings):
             style_key = _drawing_style_key(drawing)
             kind = legend_styles.get(style_key)
+            if kind is None and (
+                style_key[1] in signal_dash_patterns
+                or (signal_dash_patterns and style_key[1] not in ("", "[] 0"))
+            ):
+                kind = "instrument_signal"
             if kind is None or kind == "ambiguous":
                 continue
             for item_index, item in enumerate(drawing.get("items", [])):
@@ -573,6 +650,153 @@ def _extract_drawing_evidence(doc: Any) -> Dict[str, Any]:
             1 for segment in segments if segment["kind"] == "process"
         ),
     }
+
+
+def _extract_ocr_labels(
+    page: Any,
+    page_index: int,
+    executable: Optional[str] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Run local Tesseract TSV OCR and retain source-page evidence for labels."""
+    executable = executable or find_tesseract_executable()
+    if executable is None:
+        raise PdfProcessError(
+            "OCR is not configured because local Tesseract was not found. "
+            "Install Tesseract OCR in Windows PowerShell with "
+            "`winget install --id UB-Mannheim.TesseractOCR -e`. If the installer "
+            "does not add it to PATH, run `$env:Path += "
+            "\";C:\\Program Files\\Tesseract-OCR\"` in the backend terminal "
+            "(or add that folder to the Windows user PATH), verify with "
+            "`tesseract --version`, and restart the backend. Scanned drawing "
+            "labels cannot be verified without it."
+        )
+
+    image = page.get_pixmap(
+        matrix=fitz.Matrix(OCR_RENDER_SCALE, OCR_RENDER_SCALE),
+        alpha=False,
+    ).tobytes("png")
+    try:
+        result = subprocess.run(
+            [executable, "stdin", "stdout", "tsv", "--psm", "11"],
+            input=image,
+            capture_output=True,
+            check=True,
+            timeout=120,
+        )
+    except FileNotFoundError as exc:
+        raise PdfProcessError(
+            "The configured Tesseract OCR executable could not be started. "
+            "Install Tesseract OCR and ensure its executable is on PATH."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PdfProcessError(
+            f"Local Tesseract OCR timed out on PDF page {page_index + 1}."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = exc.stderr.decode("utf-8", errors="replace").strip()
+        message = f"Local Tesseract OCR failed on PDF page {page_index + 1}."
+        if detail:
+            message += f" {detail}"
+        raise PdfProcessError(message) from exc
+
+    text = result.stdout.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text), delimiter="\t")
+    lines: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for row in reader:
+        if row.get("level") != "5" or not row.get("text", "").strip():
+            continue
+        key = (row["block_num"], row["par_num"], row["line_num"])
+        left = int(row["left"])
+        top = int(row["top"])
+        width = int(row["width"])
+        height = int(row["height"])
+        line = lines.setdefault(
+            key,
+            {
+                "words": [],
+                "confidences": [],
+                "left": left,
+                "top": top,
+                "right": left + width,
+                "bottom": top + height,
+            },
+        )
+        line["words"].append(row["text"].strip())
+        line["left"] = min(line["left"], left)
+        line["top"] = min(line["top"], top)
+        line["right"] = max(line["right"], left + width)
+        line["bottom"] = max(line["bottom"], top + height)
+        try:
+            confidence = float(row["conf"])
+        except (KeyError, ValueError):
+            continue
+        if math.isfinite(confidence) and 0 <= confidence <= 100:
+            line["confidences"].append(confidence)
+
+    tags: List[Dict[str, Any]] = []
+    equipment: List[Dict[str, Any]] = []
+    for line in lines.values():
+        raw_text = " ".join(line["words"]).strip()
+        tag_match = TAG_RE.fullmatch(raw_text)
+        if tag_match is None:
+            continue
+
+        bbox = _bbox_to_ints(
+            (
+                line["left"] / OCR_RENDER_SCALE,
+                line["top"] / OCR_RENDER_SCALE,
+                line["right"] / OCR_RENDER_SCALE,
+                line["bottom"] / OCR_RENDER_SCALE,
+            )
+        )
+        ocr_confidence = (
+            sum(line["confidences"]) / len(line["confidences"])
+            if line["confidences"]
+            else None
+        )
+        confidence = ocr_confidence / 100 if ocr_confidence is not None else 0.0
+        uncertain = ocr_confidence is None or ocr_confidence < OCR_MIN_CONFIDENCE
+        equipment_match = EQUIPMENT_RE.fullmatch(raw_text)
+        prefix = _prefix_without_unit(tag_match.group(1))
+        equipment_type = None
+        if equipment_match is not None:
+            prefix = _prefix_without_unit(equipment_match.group(1))
+            equipment_type = _equipment_type_from_prefix(prefix)
+
+        canonical_tag = _canonical_tag(tag_match.group(1), tag_match.group(2))
+        common = {
+            "source_bbox": bbox,
+            "source_page": page_index,
+            "confidence": confidence,
+            "page": page_index,
+            "raw_text": raw_text,
+            "ocr_confidence": ocr_confidence,
+            "ambiguous": uncertain,
+            "ambiguity_reason": "low_ocr_confidence" if uncertain else None,
+        }
+        if equipment_type is not None:
+            equipment.append(
+                {
+                    "id": f"eq_{canonical_tag.lower().replace('-', '')}",
+                    "tag": canonical_tag,
+                    "type": equipment_type,
+                    "label": f"{equipment_type.title()} {canonical_tag}",
+                    "source_symbol_bbox": None,
+                    **common,
+                }
+            )
+            continue
+
+        tags.append(
+            {
+                "tag_name": canonical_tag,
+                "type": _infer_instrument_type(canonical_tag),
+                "parent_equipment": None,
+                **common,
+            }
+        )
+
+    return tags, equipment
 
 
 def _merge_with_sample(
@@ -619,8 +843,9 @@ def match_excel_inventory(
     Reconcile PDF detections against the Excel I/O inventory.
 
     Matches unique inventory tags only. Repeated inventory rows are grouped and
-    marked ambiguous; absent tags are missing and PDF-only detections remain
-    visible as ambiguous rows.
+    marked ambiguous; absent records are marked missing only when their
+    physical visibility and referenced drawing scope can be evaluated.
+    PDF-only detections remain visible as ambiguous rows.
     """
     pdf_index = {t["tag_name"]: t for t in pdf_tags}
     audit: List[Dict[str, Any]] = []
@@ -634,6 +859,8 @@ def match_excel_inventory(
         detected = pdf_index.get(name)
         bbox = detected.get("source_bbox") if detected else None
         valid_bbox = has_valid_source_bbox(bbox)
+        source_text = detected.get("raw_text") if detected else None
+        ocr_confidence = detected.get("ocr_confidence") if detected else None
         duplicate_rows = len(inventory_rows) > 1
         detected_as_ambiguous = bool(
             detected and detected.get("ambiguous") and valid_bbox
@@ -641,7 +868,11 @@ def match_excel_inventory(
 
         if duplicate_rows or detected_as_ambiguous:
             status = "Ambiguous"
-            reason = "duplicate_inventory_tag" if duplicate_rows else "ambiguous_pdf_detection"
+            reason = (
+                "duplicate_inventory_tag"
+                if duplicate_rows
+                else detected.get("ambiguity_reason") or "ambiguous_pdf_detection"
+            )
             audit.append(
                 {
                     "tag_name": name,
@@ -654,6 +885,8 @@ def match_excel_inventory(
                     "status": status,
                     "confidence": float(detected.get("confidence", 0.5)) if valid_bbox else 0.0,
                     "source_page": detected.get("source_page", detected.get("page")) if valid_bbox else None,
+                    "raw_text": source_text,
+                    "ocr_confidence": ocr_confidence,
                     "parent_equipment": detected.get("parent_equipment") if detected else None,
                     "reason": reason,
                 }
@@ -661,6 +894,28 @@ def match_excel_inventory(
             continue
 
         if detected is None or detected.get("missing") or not valid_bbox:
+            is_sw = bool(
+                excel_row.get("is_software_derived")
+                or str(excel_row.get("location", "")).upper() == "DCS"
+                or str(excel_row.get("io_type", "")).upper() in ("SW", "SOFTWARE")
+            )
+            scope_review = excel_row.get("source_visibility") == "scope_review"
+            page_scope_unverified = bool(excel_row.get("pid_ref")) and not bool(
+                excel_row.get("page_scope_verified")
+            )
+            if is_sw or scope_review or page_scope_unverified:
+                status = "Pending Review"
+            else:
+                status = "Missing in P&ID"
+            if is_sw:
+                reason = "software_derived_record"
+            elif scope_review:
+                reason = "source_visibility_unverified"
+            elif page_scope_unverified:
+                reason = "source_page_mapping_unverified"
+            else:
+                reason = "no_valid_source_detection"
+
             audit.append(
                 {
                     "tag_name": name,
@@ -668,11 +923,15 @@ def match_excel_inventory(
                     "source_bbox": [0, 0, 0, 0],
                     "excel_row": excel_row["excel_row"],
                     "excel_rows": [int(excel_row["excel_row"])],
-                    "status": "Missing in P&ID",
+                    "excel_sheet": excel_row.get("excel_sheet"),
+                    "excel_sheets": [excel_row.get("excel_sheet")],
+                    "status": status,
                     "confidence": 0.0,
                     "source_page": None,
+                    "raw_text": source_text,
+                    "ocr_confidence": ocr_confidence,
                     "parent_equipment": detected.get("parent_equipment") if detected else None,
-                    "reason": "no_valid_source_detection",
+                    "reason": reason,
                 }
             )
             continue
@@ -689,6 +948,8 @@ def match_excel_inventory(
                 "status": "Matched",
                 "confidence": float(detected.get("confidence", 0.9)),
                 "source_page": detected.get("source_page", detected.get("page")),
+                "raw_text": source_text,
+                "ocr_confidence": ocr_confidence,
                 "parent_equipment": detected.get("parent_equipment"),
                 "reason": None,
             }
@@ -712,6 +973,8 @@ def match_excel_inventory(
                 "status": "Ambiguous",
                 "confidence": float(tag.get("confidence", 0.5)),
                 "source_page": tag.get("source_page", tag.get("page")),
+                "raw_text": tag.get("raw_text"),
+                "ocr_confidence": tag.get("ocr_confidence"),
                 "parent_equipment": tag.get("parent_equipment"),
                 "reason": "unmatched_pdf_detection",
             }
@@ -724,9 +987,11 @@ def has_valid_source_bbox(bbox: Any) -> bool:
     """Return whether a detection has a finite, non-empty source rectangle."""
     if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
         return False
+    if any(isinstance(value, bool) or not isinstance(value, Real) for value in bbox):
+        return False
     try:
         x1, y1, x2, y2 = (float(value) for value in bbox)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return False
     return (
         all(math.isfinite(value) for value in (x1, y1, x2, y2))
@@ -759,9 +1024,14 @@ def process_pdf(
     extracted_tags: List[Dict[str, Any]] = []
     extracted_equipment: List[Dict[str, Any]] = []
     clarifications: List[Dict[str, Any]] = []
+    deferred_clarification_count = 0
     drawing_evidence: Dict[str, Any] = {
         "segments": [],
         "classified_process_lines": 0,
+    }
+    raster_linework: Dict[str, List[Dict[str, Any]]] = {
+        "segments": [],
+        "intersection_candidates": [],
     }
 
     if not file_bytes:
@@ -771,7 +1041,8 @@ def process_pdf(
         if not demo_mode:
             raise PdfProcessError(
                 "PDF text extraction is unavailable because PyMuPDF is not "
-                "installed; OCR is not configured, so drawing tags cannot be verified."
+                "installed. Install the backend requirements to render and "
+                "extract PDF evidence."
             )
         logger.warning("PyMuPDF (fitz) is not installed; using demo entities.")
     else:
@@ -791,6 +1062,51 @@ def process_pdf(
                 has_embedded_text,
             ) = _extract_embedded_text(doc)
             drawing_evidence = _extract_drawing_evidence(doc)
+            for page_index in range(len(doc)):
+                page = doc[page_index]
+                if not page.get_images(full=True):
+                    continue
+                page_linework = extract_raster_linework(page, page_index)
+                raster_linework["segments"].extend(page_linework["segments"])
+                raster_linework["intersection_candidates"].extend(
+                    page_linework["intersection_candidates"]
+                )
+                logger.info(
+                    "Raster evidence page %d: %d line candidates, %d unresolved intersections",
+                    page_index + 1,
+                    len(page_linework["segments"]),
+                    len(page_linework["intersection_candidates"]),
+                )
+            detected_tag_pages = {
+                int(item.get("source_page", item.get("page", -1)))
+                for item in extracted_tags + extracted_equipment
+            }
+            for page_index in range(len(doc)):
+                page = doc[page_index]
+                if page_index in detected_tag_pages:
+                    continue
+                if not page.get_images(full=True) and page.get_text("text").strip():
+                    continue
+                ocr_tags, ocr_equipment = _extract_ocr_labels(page, page_index)
+                logger.info(
+                    "OCR page %d: %d tag detections, %d equipment detections",
+                    page_index + 1,
+                    len(ocr_tags),
+                    len(ocr_equipment),
+                )
+                for detection, target, key in (
+                    *((item, extracted_tags, "tag_name") for item in ocr_tags),
+                    *((item, extracted_equipment, "tag") for item in ocr_equipment),
+                ):
+                    existing = next(
+                        (item for item in target if item.get(key) == detection[key]),
+                        None,
+                    )
+                    if existing is None:
+                        target.append(detection)
+                    else:
+                        existing["ambiguous"] = True
+                        existing["ambiguity_reason"] = "duplicate_source_detection"
             for crossing in find_ambiguous_process_crossings(drawing_evidence):
                 page = doc[crossing["page"]]
                 page_rect = page.rect
@@ -853,18 +1169,21 @@ def process_pdf(
                         "status": "pending",
                     }
                 )
+            deferred_clarification_count = max(
+                0, len(clarifications) - MAX_CLARIFICATIONS_PER_RUN
+            )
+            clarifications = clarifications[:MAX_CLARIFICATIONS_PER_RUN]
             if (
                 not demo_mode
-                and (
-                    not has_embedded_text
-                    or not (extracted_tags or extracted_equipment)
-                )
+                and not (extracted_tags or extracted_equipment)
             ):
                 raise PdfProcessError(
-                    f"No extractable text with P&ID tag or equipment labels found in "
-                    f"PDF '{filename}'; OCR is not configured and image extraction "
-                    "is unavailable, "
-                    "so drawing contents cannot be verified."
+                    f"Processed {page_count} page(s) of PDF '{filename}', but "
+                    "no P&ID tag or equipment labels could be verified from "
+                    "embedded text or local OCR. Check that the pages are "
+                    "upright and the tag text is legible at sufficient scan "
+                    "resolution. No audit was created because no source-located "
+                    "tag evidence was available."
                 )
             logger.info(
                 "Extracted %d text tags and %d equipment labels from '%s' (%d pages)",
@@ -889,7 +1208,12 @@ def process_pdf(
         "equipment": equipment,
         "tags": tags,
         "clarifications": clarifications,
+        "deferred_clarification_count": deferred_clarification_count,
         "pdf_page_count": page_count,
         "filename": filename,
         "drawing_evidence": drawing_evidence,
+        "raster_line_candidates": raster_linework["segments"],
+        "raster_intersection_candidates": raster_linework[
+            "intersection_candidates"
+        ],
     }

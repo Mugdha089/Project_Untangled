@@ -1,12 +1,10 @@
 /** FastAPI client for Project UNTANGLE backend. */
 
-export const API_BASE = 'http://localhost:8000';
+export const API_BASE = (
+  import.meta.env["VITE_UNTANGLE_API_BASE_URL"] || "http://localhost:8000"
+).replace(/\/+$/, "");
 
-export type BackendTagStatus =
-  | 'Matched'
-  | 'Missing in P&ID'
-  | 'Pending Review'
-  | 'Ambiguous';
+export type BackendTagStatus = "Matched" | "Missing in P&ID" | "Pending Review" | "Ambiguous";
 
 export interface BackendKpiSummary {
   total_tags: number;
@@ -26,12 +24,15 @@ export interface BackendKpiSummary {
   pending_review_tags?: number;
   audit_rows?: number;
   clarification_items?: number;
+  deferred_clarification_items?: number;
+  raster_line_candidates?: number;
+  raster_intersection_candidates?: number;
 }
 
 export interface BackendEquipmentNode {
   id: string;
   tag: string;
-  type: 'tank' | 'pump' | 'mixer' | 'exchanger' | 'vessel' | 'valve' | 'filter' | 'junction';
+  type: "tank" | "pump" | "mixer" | "exchanger" | "vessel" | "valve" | "filter" | "junction";
   label: string;
   source_bbox: number[];
   source_page: number;
@@ -53,6 +54,26 @@ export interface BackendProcessEdge {
   source_bbox?: number[] | null;
 }
 
+export interface BackendRasterLineCandidate {
+  id: string;
+  page: number;
+  start: number[];
+  end: number[];
+  source_bbox: number[];
+  orientation: "horizontal" | "vertical";
+  kind: "unclassified";
+  evidence_status: "provisional";
+}
+
+export interface BackendRasterIntersectionCandidate {
+  id: string;
+  page: number;
+  point: number[];
+  source_bbox: number[];
+  segment_ids: string[];
+  evidence_status: "unresolved";
+}
+
 export interface BackendTagAuditItem {
   tag_name: string;
   type: string;
@@ -64,6 +85,8 @@ export interface BackendTagAuditItem {
   excel_sheets?: (string | null)[];
   status: BackendTagStatus;
   confidence: number;
+  raw_text?: string | null;
+  ocr_confidence?: number | null;
   reason?: string | null;
 }
 
@@ -98,6 +121,8 @@ export interface ProcessPidResponse {
   edges: BackendProcessEdge[];
   tag_audit: BackendTagAuditItem[];
   clarification_queue: BackendClarificationItem[];
+  raster_line_candidates?: BackendRasterLineCandidate[];
+  raster_intersection_candidates?: BackendRasterIntersectionCandidate[];
   clarification_decisions: BackendClarificationDecision[];
   pdf_page_count: number;
 }
@@ -131,7 +156,7 @@ export class UntangleApiError extends Error {
 
   constructor(message: string, opts?: { status?: number; unreachable?: boolean }) {
     super(message);
-    this.name = 'UntangleApiError';
+    this.name = "UntangleApiError";
     if (opts?.status !== undefined) this.status = opts.status;
     this.unreachable = opts?.unreachable ?? false;
   }
@@ -163,10 +188,27 @@ function reportUnauthorized(response: Response): void {
 
 export async function login(email: string, password: string): Promise<AuthSession> {
   const response = await fetch(`${API_BASE}/api/auth/login`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ email, password }),
   });
-  if (!response.ok) throw new UntangleApiError(await parseError(response), { status: response.status });
+  if (!response.ok)
+    throw new UntangleApiError(await parseError(response), { status: response.status });
+  return response.json() as Promise<AuthSession>;
+}
+
+export async function register(
+  email: string,
+  password: string,
+  fullName: string,
+): Promise<AuthSession> {
+  const response = await fetch(`${API_BASE}/api/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, full_name: fullName }),
+  });
+  if (!response.ok)
+    throw new UntangleApiError(await parseError(response), { status: response.status });
   return response.json() as Promise<AuthSession>;
 }
 
@@ -182,9 +224,9 @@ export async function getCurrentUser(token: string): Promise<AuthUser> {
 async function parseError(response: Response): Promise<string> {
   try {
     const data = (await response.json()) as { detail?: string | { msg?: string }[] };
-    if (typeof data.detail === 'string') return data.detail;
+    if (typeof data.detail === "string") return data.detail;
     if (Array.isArray(data.detail)) {
-      return data.detail.map(d => d.msg ?? JSON.stringify(d)).join('; ');
+      return data.detail.map((d) => d.msg ?? JSON.stringify(d)).join("; ");
     }
   } catch {
     /* ignore */
@@ -192,21 +234,25 @@ async function parseError(response: Response): Promise<string> {
   return `Request failed (${response.status})`;
 }
 
-export async function processPid(pdf: File, excel: File, token: string): Promise<ProcessPidResponse> {
+export async function processPid(
+  pdf: File,
+  excel: File,
+  token: string,
+): Promise<ProcessPidResponse> {
   const form = new FormData();
-  form.append('file_pdf', pdf);
-  form.append('file_excel', excel);
+  form.append("file_pdf", pdf);
+  form.append("file_excel", excel);
 
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/process-pid`, {
-      method: 'POST',
+      method: "POST",
       headers: authHeaders(token),
       body: form,
     });
   } catch {
     throw new UntangleApiError(
-      'Cannot reach UNTANGLE backend at http://localhost:8000. Start the FastAPI server and try again.',
+      `Cannot reach UNTANGLE backend at ${API_BASE}. Start the FastAPI server and try again.`,
       { unreachable: true },
     );
   }
@@ -220,7 +266,9 @@ export async function processPid(pdf: File, excel: File, token: string): Promise
 }
 
 export async function listSavedRuns(token: string, limit = 20): Promise<SavedRunListResponse> {
-  const response = await fetch(`${API_BASE}/api/runs?limit=${encodeURIComponent(limit)}`, { headers: authHeaders(token) });
+  const response = await fetch(`${API_BASE}/api/runs?limit=${encodeURIComponent(limit)}`, {
+    headers: authHeaders(token),
+  });
   if (!response.ok) {
     reportUnauthorized(response);
     throw new UntangleApiError(await parseError(response), { status: response.status });
@@ -229,7 +277,9 @@ export async function listSavedRuns(token: string, limit = 20): Promise<SavedRun
 }
 
 export async function getSavedRun(runId: string, token: string): Promise<ProcessPidResponse> {
-  const response = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}`, { headers: authHeaders(token) });
+  const response = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}`, {
+    headers: authHeaders(token),
+  });
   if (!response.ok) {
     reportUnauthorized(response);
     throw new UntangleApiError(await parseError(response), { status: response.status });
@@ -237,8 +287,14 @@ export async function getSavedRun(runId: string, token: string): Promise<Process
   return (await response.json()) as ProcessPidResponse;
 }
 
-export async function getSavedRunFile(runId: string, kind: "pdf" | "excel", token: string): Promise<Blob> {
-  const response = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/files/${kind}`, { headers: authHeaders(token) });
+export async function getSavedRunFile(
+  runId: string,
+  kind: "pdf" | "excel",
+  token: string,
+): Promise<Blob> {
+  const response = await fetch(`${API_BASE}/api/runs/${encodeURIComponent(runId)}/files/${kind}`, {
+    headers: authHeaders(token),
+  });
   if (!response.ok) {
     reportUnauthorized(response);
     throw new UntangleApiError(await parseError(response), { status: response.status });
@@ -255,13 +311,13 @@ export async function resolveAmbiguity(
   let response: Response;
   try {
     response = await fetch(`${API_BASE}/api/resolve-ambiguity`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders(token) },
       body: JSON.stringify({ run_id: runId, item_id: itemId, selected_option: selectedOption }),
     });
   } catch {
     throw new UntangleApiError(
-      'Cannot reach UNTANGLE backend at http://localhost:8000. Start the FastAPI server and try again.',
+      `Cannot reach UNTANGLE backend at ${API_BASE}. Start the FastAPI server and try again.`,
       { unreachable: true },
     );
   }
@@ -272,6 +328,31 @@ export async function resolveAmbiguity(
   }
 
   return (await response.json()) as ResolveAmbiguityResponse;
+}
+
+export async function resolveAmbiguities(
+  runId: string,
+  answers: Array<{ item_id: string; selected_option: string }>,
+  token: string,
+): Promise<ProcessPidResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}/api/resolve-ambiguities`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders(token) },
+      body: JSON.stringify({ run_id: runId, answers }),
+    });
+  } catch {
+    throw new UntangleApiError(
+      `Cannot reach UNTANGLE backend at ${API_BASE}. Start the FastAPI server and try again.`,
+      { unreachable: true },
+    );
+  }
+  if (!response.ok) {
+    reportUnauthorized(response);
+    throw new UntangleApiError(await parseError(response), { status: response.status });
+  }
+  return (await response.json()) as ProcessPidResponse;
 }
 
 export async function checkHealth(): Promise<boolean> {

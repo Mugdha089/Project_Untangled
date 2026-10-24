@@ -71,8 +71,10 @@ import {
   getSavedRun,
   getSavedRunFile,
   getCurrentUser,
+  listSavedRuns,
   processPid,
-  resolveAmbiguity,
+  resolveAmbiguities,
+  type SavedRunSummary,
   UntangleApiError,
 } from "@/lib/untangle-api";
 import { exportDiagram } from "@/lib/diagram-export";
@@ -140,6 +142,7 @@ function Index() {
   const [queueIndex, setQueueIndex] = useState(0);
   const [resolution, setResolution] = useState<Resolution>("bridge");
   const [selectedOption, setSelectedOption] = useState<string>("");
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({});
   const [userConfirmedTags, setUserConfirmedTags] = useState<string[]>([]);
   const [locatingTag, setLocatingTag] = useState<string | null>(null);
   const [locating, setLocating] = useState(false);
@@ -147,6 +150,7 @@ function Index() {
   const [expanded, setExpanded] = useState<"source" | "pfd" | null>(null);
   const [exporting, setExporting] = useState(false);
   const [processing, setProcessing] = useState(false);
+  const [restoringRun, setRestoringRun] = useState(false);
   const [resolving, setResolving] = useState(false);
   const [projectName, setProjectName] = useState("Project_Alpha_4K_Sheet_01.pdf");
   const [excelName, setExcelName] = useState("Project_Alpha_IO_List.xlsx");
@@ -158,6 +162,7 @@ function Index() {
   const [authToken, setAuthToken] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [currentRunId, setCurrentRunId] = useState<string | null>(null);
+  const [savedRuns, setSavedRuns] = useState<SavedRunSummary[]>([]);
   const runRequestToken = useRef(0);
 
   const clearAuthenticatedWorkspace = useCallback(() => {
@@ -171,6 +176,8 @@ function Index() {
     setQueue(demoClarifications);
     setWorkspaceMetrics(demoMetrics);
     setUserConfirmedTags([]);
+    setSavedRuns([]);
+    setAnswerDrafts({});
   }, []);
 
   const updatePfdScales = useCallback((fitScale: number, autoScale: number) => {
@@ -188,25 +195,42 @@ function Index() {
     let cancelled = false;
     try {
       const token = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY);
-      if (!token) { setAuthReady(true); return; }
-      void getCurrentUser(token).then((user) => {
-        if (cancelled) return;
-        setAuthToken(token);
-        setAuthUser({ userId: user.user_id, fullName: user.full_name, email: user.email, role: user.role });
-      }).catch((error: unknown) => {
-        if (!cancelled) {
-          localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
-          setAuthUser(null);
-          if (error instanceof UntangleApiError && error.status === 401) {
-            toast.error("Session expired", { description: "Sign in again to access saved runs." });
+      if (!token) {
+        setAuthReady(true);
+        return;
+      }
+      void getCurrentUser(token)
+        .then((user) => {
+          if (cancelled) return;
+          setAuthToken(token);
+          setAuthUser({
+            userId: user.user_id,
+            fullName: user.full_name,
+            email: user.email,
+            role: user.role,
+          });
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            localStorage.removeItem(AUTH_TOKEN_STORAGE_KEY);
+            setAuthUser(null);
+            if (error instanceof UntangleApiError && error.status === 401) {
+              toast.error("Session expired", {
+                description: "Sign in again to access saved runs.",
+              });
+            }
           }
-        }
-      }).finally(() => { if (!cancelled) setAuthReady(true); });
+        })
+        .finally(() => {
+          if (!cancelled) setAuthReady(true);
+        });
     } catch (error) {
       console.error("Unable to restore the UNTANGLE session.", error);
       setAuthReady(true);
     }
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -262,12 +286,7 @@ function Index() {
         setLiveConnected(true);
         setQueueIndex(0);
         setResolution("bridge");
-        setSelectedOption(
-          mapped.clarifications[0]?.selectedOption ??
-            (mapped.clarifications[0]
-              ? resolutionToOption(mapped.clarifications[0], "bridge")
-              : ""),
-        );
+        setSelectedOption(mapped.clarifications[0]?.selectedOption ?? "");
         if (mapped.clarifications.length) setQueueOpen(true);
 
         try {
@@ -290,16 +309,37 @@ function Index() {
     };
   }, [authToken]);
 
+  useEffect(() => {
+    if (!authToken) {
+      setSavedRuns([]);
+      return;
+    }
+    let cancelled = false;
+    void listSavedRuns(authToken)
+      .then((result) => {
+        if (!cancelled) setSavedRuns(result.runs);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          console.error("Unable to load saved UNTANGLE runs.", error);
+          toast.error("Saved runs unavailable", {
+            description:
+              error instanceof Error ? error.message : "The run list could not be loaded.",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [authToken]);
+
   const active = hovered ?? selected;
   const current = queue[queueIndex];
-  const activeOption = selectedOption || (current ? resolutionToOption(current, resolution) : "");
+  const activeOption = (current ? answerDrafts[current.id] : undefined) ?? selectedOption;
 
   const tags = useMemo(
     () =>
-      userConfirmedTags.reduce(
-        (rows, tagName) => markTagUserConfirmed(rows, tagName),
-        auditRows,
-      ),
+      userConfirmedTags.reduce((rows, tagName) => markTagUserConfirmed(rows, tagName), auditRows),
     [auditRows, userConfirmedTags],
   );
 
@@ -360,6 +400,18 @@ function Index() {
       const response = await processPid(pdf, excel, authToken);
       const mapped = mapProcessResponse(response);
       setCurrentRunId(mapped.runId);
+      setSavedRuns((runs) =>
+        [
+          {
+            run_id: response.run_id,
+            created_at: response.created_at,
+            pdf_filename: response.pdf_filename,
+            excel_filename: response.excel_filename,
+            kpis: response.kpis,
+          },
+          ...runs.filter((run) => run.run_id !== response.run_id),
+        ].slice(0, 20),
+      );
       try {
         localStorage.setItem(LAST_RUN_STORAGE_KEY, mapped.runId);
       } catch (error) {
@@ -380,9 +432,8 @@ function Index() {
       setLiveConnected(true);
       setQueueIndex(0);
       setResolution("bridge");
-      setSelectedOption(
-        mapped.clarifications[0] ? resolutionToOption(mapped.clarifications[0], "bridge") : "",
-      );
+      setSelectedOption("");
+      setAnswerDrafts({});
       toast.success("P&ID processed", {
         description: `${mapped.metrics.matched}/${mapped.metrics.total} tags matched in ${mapped.metrics.seconds}s`,
         id: "untangle-process",
@@ -395,11 +446,45 @@ function Index() {
     }
   };
 
+  const openSavedRun = async (runId: string) => {
+    if (!authToken) return;
+    setRestoringRun(true);
+    try {
+      const response = await getSavedRun(runId, authToken);
+      const mapped = mapProcessResponse(response);
+      setCurrentRunId(mapped.runId);
+      try {
+        localStorage.setItem(LAST_RUN_STORAGE_KEY, mapped.runId);
+      } catch (error) {
+        console.error("Unable to remember the selected saved run.", error);
+      }
+      setWorkspaceMetrics(mapped.metrics);
+      setAuditRows(mapped.auditTags);
+      setGraphNodes(mapped.graphNodes);
+      setGraphEdges(mapped.graphEdges);
+      setQueue(mapped.clarifications);
+      setPdfPageCount(mapped.pdfPageCount);
+      setProjectName(mapped.pdfFilename);
+      setExcelName(mapped.excelFilename);
+      setUserConfirmedTags([]);
+      setLiveConnected(true);
+      setQueueIndex(0);
+      setSelectedOption(mapped.clarifications[0]?.selectedOption ?? "");
+      setAnswerDrafts({});
+      setQueueOpen(mapped.clarifications.length > 0);
+      const pdf = await getSavedRunFile(mapped.runId, "pdf", authToken);
+      setSourcePdf(new File([pdf], mapped.pdfFilename, { type: "application/pdf" }));
+      toast.success("Saved run opened", { description: mapped.pdfFilename });
+    } catch (error) {
+      showApiError(error);
+    } finally {
+      setRestoringRun(false);
+    }
+  };
+
   const confirmLocatedTag = (tagName: string) => {
     setAuditRows((rows) => markTagUserConfirmed(rows, tagName));
-    setUserConfirmedTags((tags) =>
-      (tags.includes(tagName) ? tags : [...tags, tagName]),
-    );
+    setUserConfirmedTags((tags) => (tags.includes(tagName) ? tags : [...tags, tagName]));
     setLocatingTag(null);
     setLocating(false);
     notify(
@@ -417,51 +502,56 @@ function Index() {
   const openQueue = () => {
     setQueueIndex(0);
     setResolution("bridge");
-    if (queue[0]) setSelectedOption(resolutionToOption(queue[0], "bridge"));
+    setSelectedOption(queue[0]?.selectedOption ?? "");
     setQueueOpen(true);
   };
 
   const applyResolution = async () => {
     if (!current) return;
-    const option = activeOption || resolutionToOption(current, resolution);
+    const answers = Object.entries(answerDrafts).map(([item_id, selected_option]) => ({
+      item_id,
+      selected_option,
+    }));
+    if (!answers.length && liveConnected) {
+      toast.error("No answers selected", {
+        description: "Choose an option for at least one question before updating the diagram.",
+      });
+      return;
+    }
+    const option = activeOption || resolutionToOption(current, "bridge");
     setResolving(true);
     try {
       if (liveConnected) {
         if (!currentRunId) throw new Error("The saved run ID is unavailable.");
         if (!authToken) throw new Error("Sign in to resolve clarifications.");
-        const result = await resolveAmbiguity(currentRunId, current.id, option, authToken);
-        const integrityMatch = result.kpis.graph_integrity.match(/(\d+)\s*%/);
-        setGraphNodes(mapGraphNodes(result.nodes));
-        setGraphEdges(mapGraphEdges(result.edges));
-        setWorkspaceMetrics((prev) => ({
-          ...prev,
-          matched: result.kpis.matched_tags,
-          total: result.kpis.total_tags,
-          retained: result.kpis.retained_equipment,
-          equipmentTotal: result.kpis.retained_equipment,
-          seconds: Number(result.kpis.processing_time_seconds.toFixed(2)),
-          graphIntegrityLabel: result.kpis.graph_integrity,
-          integrity: integrityMatch ? Number(integrityMatch[1]) : null,
-          changedEdges: Number(result.kpis.graph_integrity.match(/(\d+)\s+changed/i)?.[1] ?? 0),
-        }));
+        const result = await resolveAmbiguities(currentRunId, answers, authToken);
+        const mapped = mapProcessResponse(result);
+        setWorkspaceMetrics(mapped.metrics);
+        setAuditRows(mapped.auditTags);
+        setGraphNodes(mapped.graphNodes);
+        setGraphEdges(mapped.graphEdges);
+        setQueue(mapped.clarifications);
+        setQueueIndex(0);
+        setSelectedOption(mapped.clarifications[0]?.selectedOption ?? "");
+        setAnswerDrafts({});
         toast.success("Clarification recorded", {
-          description: result.message,
+          description: "Selected answers were saved together and the affected graph was updated.",
           id: "untangle-clarification",
         });
+        if (!mapped.clarifications.length) setQueueOpen(false);
       } else {
         notify(
           resolution === "unresolved"
             ? "Intersection kept flagged for review."
             : `Intersection #${String(current.id).padStart(2, "0")} resolved. Source topology remains unverified.`,
         );
+        const next = resolveQueue(queue, current.id, option);
+        setQueue(next);
+        setQueueIndex(0);
+        setResolution("bridge");
+        setSelectedOption(next[0] ? resolutionToOption(next[0], "bridge") : "");
+        if (!next.length) setQueueOpen(false);
       }
-
-      const next = resolveQueue(queue, current.id, option);
-      setQueue(next);
-      setQueueIndex(0);
-      setResolution("bridge");
-      setSelectedOption(next[0] ? resolutionToOption(next[0], "bridge") : "");
-      if (!next.length) setQueueOpen(false);
     } catch (error) {
       showApiError(error);
     } finally {
@@ -487,11 +577,7 @@ function Index() {
   const changePfdZoom = (direction: -1 | 1) => {
     setPfdZoom((current) => {
       const scale =
-        current === "auto"
-          ? pfdAutoScale
-          : current === "fit"
-            ? pfdFitScale
-            : current / 100;
+        current === "auto" ? pfdAutoScale : current === "fit" ? pfdFitScale : current / 100;
       return Math.max(30, Math.min(200, Math.round(scale * 100) + direction * 10));
     });
   };
@@ -517,6 +603,14 @@ function Index() {
                   <span className={`status-dot ${tag.status}`} />
                   {tag.tag}
                 </span>
+                {tag.ocrConfidence !== undefined && (
+                  <small className="mono muted-text">
+                    OCR: {tag.rawText ?? tag.tag} · {Math.round(tag.ocrConfidence)}%
+                  </small>
+                )}
+                {tag.reason && (
+                  <small className="muted-text">{tag.reason}</small>
+                )}
               </td>
               <td>{tag.type}</td>
               <td className={`mono bounds ${tag.status === "missing" ? "muted-text" : ""}`}>
@@ -699,6 +793,29 @@ function Index() {
             </div>
           </div>
           <div className="project-actions">
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" disabled={!authUser || savedRuns.length === 0}>
+                  <FileText size={15} />
+                  Saved runs ({savedRuns.length})
+                  <ChevronDown size={14} />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuLabel>Recent saved runs</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {savedRuns.map((run) => (
+                  <DropdownMenuItem
+                    key={run.run_id}
+                    disabled={processing || restoringRun}
+                    onSelect={() => void openSavedRun(run.run_id)}
+                  >
+                    {run.pdf_filename}
+                    {run.run_id === currentRunId ? " · Open" : ""}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <Button variant="outline" className="queue-button" onClick={openQueue}>
               <TriangleAlert size={15} />
               Clarification queue
@@ -790,18 +907,18 @@ function Index() {
               <ShieldCheck size={16} />
             </div>
             <div className="metric-value">
-              {workspaceMetrics.integrity ?? '—'}
+              {workspaceMetrics.integrity ?? "—"}
               {workspaceMetrics.integrity !== null && (
                 <span className="metric-denominator percent">%</span>
               )}
               <span className="metric-qualifier">
-                {workspaceMetrics.integrity === null ? 'Not verified' : 'Reported'}
+                {workspaceMetrics.integrity === null ? "Not verified" : "Reported"}
               </span>
             </div>
             <div className="metric-foot">
               <span>
                 <span
-                  className={`status-dot ${workspaceMetrics.integrity === null ? 'pending' : 'matched'}`}
+                  className={`status-dot ${workspaceMetrics.integrity === null ? "pending" : "matched"}`}
                 />
                 {workspaceMetrics.graphIntegrityLabel}
               </span>
@@ -831,7 +948,7 @@ function Index() {
                 <ShieldCheck size={11} />
                 Local evidence pipeline
               </span>
-              <span>No OCR for image-only PDFs</span>
+              <span>Image-only OCR requires local Tesseract</span>
             </div>
           </div>
         </section>
@@ -1048,7 +1165,9 @@ function Index() {
                   Fit
                 </Button>
               </div>
-              <span className={`validated-badge ${workspaceMetrics.integrity === null ? "unverified-badge" : ""}`}>
+              <span
+                className={`validated-badge ${workspaceMetrics.integrity === null ? "unverified-badge" : ""}`}
+              >
                 <ShieldCheck size={12} />
                 {workspaceMetrics.integrity === null ? "Topology unverified" : "Integrity reported"}
               </span>
@@ -1119,7 +1238,17 @@ function Index() {
                 <span className="legend-square collapsed-legend" />
                 Collapsed control loops
               </span>
-              <span className={workspaceMetrics.integrity === null ? "unverified-text" : "success-text"}>
+              {(workspaceMetrics.rasterLineCandidates ?? 0) > 0 && (
+                <span className="unverified-text">
+                  <TriangleAlert size={12} />
+                  {workspaceMetrics.rasterLineCandidates} raster stroke candidates ·{" "}
+                  {workspaceMetrics.rasterIntersectionCandidates ?? 0} unresolved intersections ·
+                  excluded from confirmed graph edges
+                </span>
+              )}
+              <span
+                className={workspaceMetrics.integrity === null ? "unverified-text" : "success-text"}
+              >
                 {workspaceMetrics.integrity === null ? (
                   <TriangleAlert size={12} />
                 ) : (
@@ -1198,6 +1327,12 @@ function Index() {
                 {workspaceMetrics.duplicateInventoryTags ?? 0} duplicate inventory tags
               </span>
               <span>{queue.length} clarification items</span>
+              {(workspaceMetrics.deferredClarificationItems ?? 0) > 0 && (
+                <span>
+                  {workspaceMetrics.deferredClarificationItems} additional topology flags remain
+                  provisional
+                </span>
+              )}
             </div>
           </div>
           {auditOpen && (
@@ -1264,7 +1399,7 @@ function Index() {
           </span>
           <span>
             <Zap size={12} />
-            OCR unavailable for image-only PDFs
+            Local Tesseract OCR for image-only PDFs
             <span className="footer-separator">/</span>
             <span>UNTANGLE ENGINE v1.0</span>
             <CircleHelp size={14} />
@@ -1346,6 +1481,7 @@ function Index() {
                         checked={isSelected}
                         onChange={() => {
                           setSelectedOption(option);
+                          setAnswerDrafts((drafts) => ({ ...drafts, [current.id]: option }));
                           setResolution(value);
                         }}
                       />
@@ -1377,16 +1513,26 @@ function Index() {
                     const nextIndex = (queueIndex + 1) % queue.length;
                     setQueueIndex(nextIndex);
                     setResolution("bridge");
-                    if (queue[nextIndex])
-                      setSelectedOption(resolutionToOption(queue[nextIndex], "bridge"));
+                    if (queue[nextIndex]) {
+                      setSelectedOption(
+                        answerDrafts[queue[nextIndex].id] ?? queue[nextIndex].selectedOption ?? "",
+                      );
+                    }
                   }}
                 >
-                  Skip
+                  {queueIndex + 1 < queue.length ? "Skip / Next" : "Skip"}
                   <ChevronRight size={14} />
                 </Button>
-                <Button onClick={() => void applyResolution()} disabled={resolving}>
+                <Button
+                  onClick={() => void applyResolution()}
+                  disabled={resolving || (liveConnected && Object.keys(answerDrafts).length === 0)}
+                >
                   {resolving ? <Loader2 className="spin" size={14} /> : <RefreshCw size={14} />}
-                  {resolving ? "Re-validating…" : "Apply & re-validate graph"}
+                  {resolving
+                    ? "Updating diagram…"
+                    : liveConnected
+                      ? `Confirm answers & update diagram (${Object.keys(answerDrafts).length})`
+                      : "Apply & re-validate graph"}
                 </Button>
               </div>
               <div className="modal-note">
@@ -1399,22 +1545,28 @@ function Index() {
               <CheckCircle2 size={40} />
               <h3>No clarification items remain.</h3>
               <p>
-                Topology status: {workspaceMetrics.integrity === null ? "unverified" : "integrity reported"}.
+                Topology status:{" "}
+                {workspaceMetrics.integrity === null ? "unverified" : "integrity reported"}.
               </p>
               <Button onClick={() => setQueueOpen(false)}>Return to workspace</Button>
             </div>
           )}
         </DialogContent>
       </Dialog>
-      <AuthModal open={authReady && !authUser} onAuthenticated={(user, token) => {
-        try {
-          localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
-          setAuthToken(token);
-          setAuthUser(user);
-        } catch {
-          toast.error("Unable to save session", { description: "Browser storage is unavailable." });
-        }
-      }} />
+      <AuthModal
+        open={authReady && !authUser}
+        onAuthenticated={(user, token) => {
+          try {
+            localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+            setAuthToken(token);
+            setAuthUser(user);
+          } catch {
+            toast.error("Unable to save session", {
+              description: "Browser storage is unavailable.",
+            });
+          }
+        }}
+      />
     </div>
   );
 }

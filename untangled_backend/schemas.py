@@ -8,8 +8,14 @@ from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=1, max_length=128)
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=12, max_length=128)
+    full_name: str = Field(..., min_length=1, max_length=100)
 
 
 class AuthUser(BaseModel):
@@ -57,6 +63,8 @@ class TagAuditItem(BaseModel):
     excel_sheets: List[Optional[str]] = Field(default_factory=list)
     status: TagStatus
     confidence: float = Field(..., ge=0.0, le=1.0)
+    raw_text: Optional[str] = None
+    ocr_confidence: Optional[float] = Field(default=None, ge=0.0, le=100.0)
     reason: Optional[str] = None
 
 
@@ -91,6 +99,30 @@ class ProcessEdge(BaseModel):
     source_segment_ids: List[str] = Field(default_factory=list)
     source_page: Optional[int] = None
     source_bbox: Optional[List[int]] = Field(default=None, min_length=4, max_length=4)
+
+
+class RasterLineCandidate(BaseModel):
+    """Raster stroke geometry retained as provisional, unclassified evidence."""
+
+    id: str
+    page: int
+    start: List[float] = Field(..., min_length=2, max_length=2)
+    end: List[float] = Field(..., min_length=2, max_length=2)
+    source_bbox: List[int] = Field(..., min_length=4, max_length=4)
+    orientation: Literal["horizontal", "vertical"]
+    kind: Literal["unclassified"] = "unclassified"
+    evidence_status: Literal["provisional"] = "provisional"
+
+
+class RasterIntersectionCandidate(BaseModel):
+    """Raster lines intersect geometrically; connectivity remains unresolved."""
+
+    id: str
+    page: int
+    point: List[float] = Field(..., min_length=2, max_length=2)
+    source_bbox: List[int] = Field(..., min_length=4, max_length=4)
+    segment_ids: List[str] = Field(default_factory=list)
+    evidence_status: Literal["unresolved"] = "unresolved"
 
 
 class ClarificationItem(BaseModel):
@@ -137,6 +169,9 @@ class KpiSummary(BaseModel):
     pending_review_tags: int = 0
     audit_rows: int = 0
     clarification_items: int = 0
+    deferred_clarification_items: int = 0
+    raster_line_candidates: int = 0
+    raster_intersection_candidates: int = 0
 
 
 class ProcessPidResponse(BaseModel):
@@ -149,6 +184,10 @@ class ProcessPidResponse(BaseModel):
     edges: List[ProcessEdge]
     tag_audit: List[TagAuditItem]
     clarification_queue: List[ClarificationItem]
+    raster_line_candidates: List[RasterLineCandidate] = Field(default_factory=list)
+    raster_intersection_candidates: List[RasterIntersectionCandidate] = Field(
+        default_factory=list
+    )
     pdf_page_count: int
     pdf_filename: str
     excel_filename: str
@@ -175,6 +214,16 @@ class ResolveAmbiguityRequest(BaseModel):
     run_id: str
     item_id: str
     selected_option: str
+
+
+class ClarificationAnswer(BaseModel):
+    item_id: str = Field(..., min_length=1)
+    selected_option: str = Field(..., min_length=1)
+
+
+class ResolveAmbiguitiesRequest(BaseModel):
+    run_id: str = Field(..., min_length=1)
+    answers: List[ClarificationAnswer] = Field(..., min_length=1)
 
 
 class ResolveAmbiguityResponse(BaseModel):

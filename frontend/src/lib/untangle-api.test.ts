@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getSavedRun, getSavedRunFile, listSavedRuns } from "./untangle-api";
+import {
+  getSavedRun,
+  getSavedRunFile,
+  listSavedRuns,
+  processPid,
+} from "./untangle-api";
 
 describe("saved run API client", () => {
   afterEach(() => vi.restoreAllMocks());
@@ -26,5 +31,32 @@ describe("saved run API client", () => {
     await expect(getSavedRunFile("run-123", "pdf", "token")).resolves.toBeInstanceOf(Blob);
     expect(fetchMock.mock.calls[0]?.[0]).toBe("http://localhost:8000/api/runs/run-123/files/pdf");
     expect((fetchMock.mock.calls[0]?.[1] as RequestInit).headers).toEqual({ Authorization: "Bearer token" });
+  });
+
+  it("posts the expected upload fields and surfaces the backend OCR error", async () => {
+    const detail =
+      "Install Tesseract OCR in Windows PowerShell with `winget install --id UB-Mannheim.TesseractOCR -e`.";
+    const fetchMock = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+    const pdf = new File(["%PDF-1.4"], "drawing.pdf", { type: "application/pdf" });
+    const excel = new File(["workbook"], "inventory.xlsx");
+
+    await expect(processPid(pdf, excel, "token")).rejects.toMatchObject({
+      message: detail,
+      status: 400,
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("http://localhost:8000/api/process-pid");
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = request.body as FormData;
+    expect(body.get("file_pdf")).toBe(pdf);
+    expect(body.get("file_excel")).toBe(excel);
+    expect(body.get("demo_mode")).toBeNull();
   });
 });

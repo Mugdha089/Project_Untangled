@@ -26,6 +26,7 @@ export function FileUploadDropzone({
   const [pdf, setPdf] = useState<File | null>(null);
   const [excel, setExcel] = useState<File | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [uploadError, setUploadError] = useState("");
 
   const assignFile = useCallback(
     (file: File) => {
@@ -34,7 +35,15 @@ export function FileUploadDropzone({
       if (lower.endsWith(".pdf")) {
         setPdf(file);
         onPdfSelected(file);
-      } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) setExcel(file);
+        setUploadError("");
+      } else if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) {
+        setExcel(file);
+        setUploadError("");
+      } else {
+        setUploadError(
+          `Unsupported file '${file.name}'. Choose a P&ID PDF or an Excel workbook (.xlsx or .xls).`,
+        );
+      }
     },
     [locked, onPdfSelected],
   );
@@ -137,6 +146,11 @@ export function FileUploadDropzone({
           }}
         />
       </div>
+      {uploadError && (
+        <p className="upload-error" role="alert">
+          {uploadError}
+        </p>
+      )}
       {locked && (
         <div className="upload-auth-gate">
           <LockKeyhole size={16} />

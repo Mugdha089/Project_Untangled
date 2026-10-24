@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -27,6 +28,7 @@ import run_storage
 import pdf_processor
 from pdf_processor import (
     PdfProcessError,
+    find_tesseract_executable,
     has_valid_source_bbox,
     match_excel_inventory,
     process_pdf,
@@ -78,6 +80,61 @@ def _workbook_bytes(rows: list[tuple[str, str]]) -> bytes:
 
 
 class PdfEvidenceTests(unittest.TestCase):
+    def test_excel_source_metadata_separates_scope_review_from_visible_hardware(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(
+            ["Tag Number", "Instrument Type", "Location", "I/O Type Name", "Signal Type"]
+        )
+        sheet.append(["631-XS-101", "Calculated status", "DCS", "SW", "-"])
+        sheet.append(["PT-101", "Pressure Transmitter", "FIELD", "HART AI", "4-20mA"])
+        sheet.append(["HS-101", "Hand Switch", "MCC", "DO", "24VDC"])
+        sheet.append(["LS-101", "Local Switch", "LP", "DI", "24VDC"])
+        buffer = io.BytesIO()
+        workbook.save(buffer)
+
+        inventory = load_excel_tags(buffer.getvalue())["tags"]
+        self.assertEqual(
+            [row["source_visibility"] for row in inventory],
+            ["software_derived", "physical_candidate", "scope_review", "scope_review"],
+        )
+        audit = match_excel_inventory([], inventory)
+        self.assertEqual(
+            [row["status"] for row in audit],
+            ["Pending Review", "Missing in P&ID", "Pending Review", "Pending Review"],
+        )
+        self.assertEqual(audit[2]["reason"], "source_visibility_unverified")
+
+    def test_unmatched_pid_reference_waits_for_verified_page_mapping(self) -> None:
+        audit = match_excel_inventory(
+            [],
+            [
+                {
+                    "tag_name": "PT-101",
+                    "type": "Pressure Transmitter",
+                    "excel_row": 2,
+                    "pid_ref": "CA-741752-001",
+                    "source_visibility": "physical_candidate",
+                }
+            ],
+        )
+
+        self.assertEqual(audit[0]["status"], "Pending Review")
+        self.assertEqual(audit[0]["reason"], "source_page_mapping_unverified")
+
+    def test_source_bbox_rejects_non_finite_and_non_numeric_coordinates(self) -> None:
+        invalid_boxes = (
+            [1, 2, float("nan"), 4],
+            [1, 2, float("inf"), 4],
+            [1, 2, 3, float("-inf")],
+            ["1", 2, 3, 4],
+            [True, 2, 3, 4],
+        )
+        for bbox in invalid_boxes:
+            with self.subTest(bbox=bbox):
+                self.assertFalse(has_valid_source_bbox(bbox))
+        self.assertTrue(has_valid_source_bbox([1, 2, 3, 4]))
+
     def test_inventory_sources_include_equipment_only_with_a_real_bbox(self) -> None:
         detections = _source_tag_detections(
             {
@@ -187,7 +244,7 @@ class BackendStartupConfigurationTests(unittest.IsolatedAsyncioTestCase):
         pdf_bytes = document.tobytes()
         document.close()
 
-        with self.assertRaisesRegex(PdfProcessError, "OCR is not configured"):
+        with self.assertRaisesRegex(PdfProcessError, "Processed 1 page"):
             process_pdf(pdf_bytes, filename="scanned-with-title.pdf")
 
     def test_matching_requires_valid_source_coordinates(self) -> None:
@@ -255,10 +312,52 @@ class BackendStartupConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(actual, expected)
                 workbook.close()
 
-    def test_scanned_fixture_remains_explicitly_unsupported(self) -> None:
+    def test_scanned_fixture_uses_ocr_or_reports_install_steps(self) -> None:
         pdf_path, _ = _fixture_files("06_scanned_image_only")
-        with self.assertRaisesRegex(PdfProcessError, "OCR is not configured"):
-            process_pdf(pdf_path.read_bytes(), filename=pdf_path.name)
+        if find_tesseract_executable() is None:
+            with self.assertRaisesRegex(PdfProcessError, "Install Tesseract OCR"):
+                process_pdf(pdf_path.read_bytes(), filename=pdf_path.name)
+        else:
+            result = process_pdf(pdf_path.read_bytes(), filename=pdf_path.name)
+            self.assertTrue(result["tags"] or result["equipment"])
+
+    def test_local_ocr_preserves_bbox_raw_text_page_and_confidence(self) -> None:
+        pdf_path, _ = _fixture_files("06_scanned_image_only")
+        tsv = (
+            "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\t"
+            "left\ttop\twidth\theight\tconf\ttext\n"
+            "5\t1\t1\t1\t1\t1\t120\t180\t360\t60\t95\t631-FIT-3051\n"
+            "5\t1\t1\t1\t2\t1\t600\t180\t360\t60\t55\t631-FIT-3052\n"
+        )
+        with patch("pdf_processor.shutil.which", return_value="tesseract"), patch(
+            "pdf_processor.subprocess.run",
+            return_value=SimpleNamespace(stdout=tsv.encode()),
+        ) as run_ocr:
+            result = process_pdf(pdf_path.read_bytes(), filename=pdf_path.name)
+
+        self.assertEqual(
+            run_ocr.call_args.args[0],
+            ["tesseract", "stdin", "stdout", "tsv", "--psm", "11"],
+        )
+        self.assertTrue(run_ocr.call_args.kwargs["check"])
+        detections = {item["tag_name"]: item for item in result["tags"]}
+        self.assertEqual(detections["631-FIT-3051"]["source_bbox"], [20, 30, 80, 40])
+        self.assertEqual(detections["631-FIT-3051"]["source_page"], 0)
+        self.assertEqual(detections["631-FIT-3051"]["raw_text"], "631-FIT-3051")
+        self.assertEqual(detections["631-FIT-3051"]["ocr_confidence"], 95.0)
+        audit = match_excel_inventory(
+            result["tags"],
+            [
+                {"tag_name": "631-FIT-3051", "type": "FIT", "excel_row": 2},
+                {"tag_name": "631-FIT-3052", "type": "FIT", "excel_row": 3},
+            ],
+        )
+        rows = {item["tag_name"]: item for item in audit}
+        self.assertEqual(rows["631-FIT-3051"]["status"], "Matched")
+        self.assertEqual(rows["631-FIT-3051"]["raw_text"], "631-FIT-3051")
+        self.assertEqual(rows["631-FIT-3051"]["ocr_confidence"], 95.0)
+        self.assertEqual(rows["631-FIT-3052"]["status"], "Ambiguous")
+        self.assertEqual(rows["631-FIT-3052"]["reason"], "low_ocr_confidence")
 
 
 class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -344,6 +443,77 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
             node_tags,
         )
 
+    async def test_raster_candidates_are_persisted_but_not_promoted_to_graph_edges(self) -> None:
+        fitz = pdf_processor.fitz
+        if fitz is None:
+            self.skipTest("PyMuPDF is unavailable")
+
+        vector_document = fitz.open()
+        vector_page = vector_document.new_page(width=100, height=80)
+        vector_page.draw_line((10, 40), (90, 40), color=(0, 0, 0), width=1)
+        raster_png = vector_page.get_pixmap(
+            matrix=fitz.Matrix(2, 2),
+            colorspace=fitz.csGRAY,
+            alpha=False,
+        ).tobytes("png")
+        vector_document.close()
+
+        scanned_document = fitz.open()
+        scanned_page = scanned_document.new_page(width=100, height=80)
+        scanned_page.insert_image(scanned_page.rect, stream=raster_png)
+        pdf_bytes = scanned_document.tobytes()
+        scanned_document.close()
+
+        ocr_tag = {
+            "tag_name": "PT-101",
+            "type": "Pressure Transmitter",
+            "source_bbox": [10, 20, 20, 30],
+            "source_page": 0,
+            "page": 0,
+            "confidence": 0.93,
+            "raw_text": "PT-101",
+            "ocr_confidence": 93.0,
+            "parent_equipment": None,
+        }
+        with patch(
+            "pdf_processor._extract_ocr_labels",
+            return_value=([ocr_tag], []),
+        ):
+            response = await self.client.post(
+                "/api/process-pid",
+                files={
+                    "file_pdf": ("raster.pdf", pdf_bytes, "application/pdf"),
+                    "file_excel": (
+                        "inventory.xlsx",
+                        _workbook_bytes([("PT-101", "Pressure Transmitter")]),
+                        EXCEL_CONTENT_TYPE,
+                    ),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertTrue(payload["raster_line_candidates"])
+        self.assertTrue(
+            all(
+                candidate["kind"] == "unclassified"
+                and candidate["evidence_status"] == "provisional"
+                for candidate in payload["raster_line_candidates"]
+            )
+        )
+        self.assertEqual(payload["edges"], [])
+        self.assertEqual(
+            payload["kpis"]["raster_line_candidates"],
+            len(payload["raster_line_candidates"]),
+        )
+
+        saved = await self.client.get(f"/api/runs/{payload['run_id']}")
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(
+            saved.json()["raster_line_candidates"],
+            payload["raster_line_candidates"],
+        )
+
     async def test_authentication_and_run_ownership(self) -> None:
         invalid = await self.client.post(
             "/api/auth/login",
@@ -392,6 +562,70 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client_b.aclose()
 
+    async def test_registration_validates_credentials_and_issues_a_session(self) -> None:
+        invalid_password = await self.client.post(
+            "/api/auth/register",
+            json={
+                "email": "new-user@example.test",
+                "password": "            ",
+                "full_name": "New User",
+            },
+        )
+        self.assertEqual(invalid_password.status_code, 422)
+
+        registered = await self.client.post(
+            "/api/auth/register",
+            json={
+                "email": "  New-User@Example.Test ",
+                "password": "a-long-enough-password",
+                "full_name": "  New User  ",
+            },
+        )
+        self.assertEqual(registered.status_code, 201, registered.text)
+        payload = registered.json()
+        self.assertEqual(payload["user"]["email"], "new-user@example.test")
+        self.assertEqual(payload["user"]["full_name"], "New User")
+        self.assertNotIn("password", payload["user"])
+
+        authenticated = await self.client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {payload['access_token']}"},
+        )
+        self.assertEqual(authenticated.status_code, 200, authenticated.text)
+        self.assertEqual(authenticated.json()["user_id"], payload["user"]["user_id"])
+        stored_user = run_storage.find_user("new-user@example.test")
+        self.assertIsNotNone(stored_user)
+        self.assertNotEqual(stored_user["password_hash"], "a-long-enough-password")
+        self.assertTrue(
+            run_storage.verify_password(
+                "a-long-enough-password",
+                stored_user["password_salt"],
+                stored_user["password_hash"],
+            )
+        )
+
+        self.client.headers["Authorization"] = f"Bearer {payload['access_token']}"
+        processed = await self._process_case("01_easy_linear")
+        self.assertEqual(processed.status_code, 200, processed.text)
+        run_id = processed.json()["run_id"]
+        saved = await self.client.get(f"/api/runs/{run_id}")
+        self.assertEqual(saved.status_code, 200, saved.text)
+        self.assertEqual(saved.json()["run_id"], run_id)
+        self.assertEqual(
+            (await self.client.get("/api/runs")).json()["runs"][0]["run_id"],
+            run_id,
+        )
+
+        duplicate = await self.client.post(
+            "/api/auth/register",
+            json={
+                "email": "new-user@example.test",
+                "password": "another-long-password",
+                "full_name": "Duplicate User",
+            },
+        )
+        self.assertEqual(duplicate.status_code, 409)
+
     async def test_private_run_endpoints_reject_unauthenticated_access(self) -> None:
         response = await self._process_case("08_ambiguous_crossing")
         self.assertEqual(response.status_code, 200, response.text)
@@ -432,15 +666,21 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.status_code, 404)
                 self.assertEqual(response.headers.get("access-control-allow-origin"), origin)
 
-    async def test_scanned_pdf_reports_ocr_unavailability_without_fabricated_matches(
+    async def test_scanned_pdf_uses_ocr_or_reports_ocr_unavailability(
         self,
     ) -> None:
         response = await self._process_case("06_scanned_image_only")
 
-        self.assertEqual(response.status_code, 400, response.text)
-        detail = response.json()["detail"].lower()
-        self.assertIn("no extractable text", detail)
-        self.assertIn("ocr", detail)
+        if find_tesseract_executable() is None:
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("install tesseract", response.json()["detail"].lower())
+        elif response.status_code == 200:
+            payload = response.json()
+            self.assertTrue(
+                any(row.get("ocr_confidence") is not None for row in payload["tag_audit"])
+            )
+        else:
+            self.assertIn("ocr", response.json()["detail"].lower())
 
     async def test_case_07_keeps_deliberately_absent_instrument_tags_missing(
         self,
@@ -513,11 +753,84 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 404, response.text)
 
+    async def test_batch_clarifications_validate_and_persist_together(self) -> None:
+        processed = await self._process_case("08_ambiguous_crossing")
+        self.assertEqual(processed.status_code, 200, processed.text)
+        payload = processed.json()
+        crossing = next(
+            item for item in payload["clarification_queue"]
+            if item["id"].startswith("crossing_")
+        )
+        nozzles = [
+            item for item in payload["clarification_queue"]
+            if item["id"].startswith("nozzle_")
+        ]
+        self.assertTrue(nozzles)
+        invalid = await self.client.post(
+            "/api/resolve-ambiguities",
+            json={
+                "run_id": payload["run_id"],
+                "answers": [
+                    {"item_id": crossing["id"], "selected_option": crossing["options"][0]},
+                    {
+                        "item_id": nozzles[0]["id"],
+                        "selected_option": "Invented connection",
+                    },
+                ],
+            },
+        )
+        self.assertEqual(invalid.status_code, 422)
+        unchanged = await self.client.get(f"/api/runs/{payload['run_id']}")
+        self.assertEqual(
+            unchanged.json()["clarification_queue"],
+            payload["clarification_queue"],
+        )
+
+        with patch("main.process_pdf", wraps=process_pdf) as process_source:
+            updated = await self.client.post(
+                "/api/resolve-ambiguities",
+                json={
+                    "run_id": payload["run_id"],
+                    "answers": [
+                        {"item_id": crossing["id"], "selected_option": crossing["options"][0]},
+                        *[
+                            {
+                                "item_id": item["id"],
+                                "selected_option": "Unresolved / Keep Flagged",
+                            }
+                            for item in nozzles
+                        ],
+                    ],
+                },
+            )
+        self.assertEqual(updated.status_code, 200, updated.text)
+        self.assertEqual(process_source.call_count, 1)
+        result = updated.json()
+        self.assertEqual(result["kpis"]["clarification_items"], len(nozzles))
+        self.assertEqual(
+            {item["id"] for item in result["clarification_queue"]},
+            {item["id"] for item in nozzles},
+        )
+        self.assertTrue(
+            all(item["status"] == "unresolved" for item in result["clarification_queue"])
+        )
+        self.assertEqual(
+            {decision["item_id"]: decision["status"] for decision in result["clarification_decisions"]},
+            {
+                crossing["id"]: "resolved",
+                **{item["id"]: "unresolved" for item in nozzles},
+            },
+        )
+        saved = await self.client.get(f"/api/runs/{payload['run_id']}")
+        self.assertEqual(saved.json()["clarification_queue"], result["clarification_queue"])
+
     async def test_unresolved_clarification_remains_available_for_later_resolution(self) -> None:
         response = await self._process_case("08_ambiguous_crossing")
         self.assertEqual(response.status_code, 200, response.text)
         run_id = response.json()["run_id"]
         item_id = response.json()["clarification_queue"][0]["id"]
+        initial_clarification_count = len(response.json()["clarification_queue"])
+        self.assertGreaterEqual(initial_clarification_count, 1)
         original_edge_ids = {edge["id"] for edge in response.json()["edges"]}
 
         unresolved = await self.client.post(
@@ -527,7 +840,10 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unresolved.status_code, 200, unresolved.text)
         self.assertFalse(unresolved.json()["topology_changed"])
         self.assertIn("remains unresolved", unresolved.json()["message"])
-        self.assertEqual(unresolved.json()["kpis"]["clarification_items"], 1)
+        self.assertEqual(
+            unresolved.json()["kpis"]["clarification_items"],
+            initial_clarification_count,
+        )
         saved = await self.client.get(f"/api/runs/{run_id}")
         self.assertEqual(saved.json()["clarification_queue"][0]["status"], "unresolved")
         self.assertEqual(
@@ -546,7 +862,10 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resolved.status_code, 200, resolved.text)
         self.assertTrue(resolved.json()["topology_changed"])
-        self.assertEqual(resolved.json()["kpis"]["clarification_items"], 0)
+        self.assertEqual(
+            resolved.json()["kpis"]["clarification_items"],
+            initial_clarification_count - 1,
+        )
         saved = await self.client.get(f"/api/runs/{run_id}")
         self.assertEqual(
             saved.json()["clarification_decisions"][0]["selected_option"],
@@ -658,6 +977,25 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(item["id"].startswith("nozzle_") for item in payload["clarification_queue"])
         )
+
+    async def test_dense_drawing_limits_questions_and_reports_deferred_flags(self) -> None:
+        response = await self._process_case("10_dense_shared_headers")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertLessEqual(len(payload["clarification_queue"]), 3)
+        self.assertEqual(
+            payload["kpis"]["clarification_items"],
+            len(payload["clarification_queue"]),
+        )
+        self.assertGreater(payload["kpis"]["deferred_clarification_items"], 0)
+        self.assertTrue(
+            all(item["evidence_crop_data_uri"] for item in payload["clarification_queue"])
+        )
+        self.assertIn(
+            "connectivity is provisional",
+            payload["kpis"]["graph_integrity"],
+        )
         self.assertTrue(
             all(
                 item["evidence_crop_data_uri"].startswith("data:image/png;base64,")
@@ -682,6 +1020,8 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_supplied_nozzle_decision_changes_graph_and_persists(self) -> None:
         pdf_path, excel_path = _supplied_fixture_files("08_multistage_recycle")
+        if not pdf_path.is_file() or not excel_path.is_file():
+            self.skipTest("Supplied mid-complex fixture pack is not present")
 
         async def upload() -> dict:
             response = await self.client.post(
@@ -926,8 +1266,17 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(case=case_name):
                 response = await self._process_case(case_name)
                 if case_name == "06_scanned_image_only":
-                    self.assertEqual(response.status_code, 400, response.text)
-                    self.assertIn("OCR", response.json()["detail"])
+                    if find_tesseract_executable() is None:
+                        self.assertEqual(response.status_code, 400, response.text)
+                        self.assertIn("install tesseract", response.json()["detail"].lower())
+                    else:
+                        self.assertEqual(response.status_code, 200, response.text)
+                        audit = {
+                            row["tag_name"]: row for row in response.json()["tag_audit"]
+                        }
+                        self.assertEqual(audit["TK-301"]["status"], "Matched")
+                        self.assertEqual(audit["TK-301"]["raw_text"], "TK-301")
+                        self.assertIsNotNone(audit["TK-301"]["ocr_confidence"])
                     continue
 
                 self.assertEqual(response.status_code, 200, response.text)
@@ -1054,10 +1403,17 @@ class PipelineRegressionTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
                 if case_name == "06_scanned_image_only":
-                    self.assertEqual(response.status_code, 400, response.text)
-                    detail = response.json()["detail"].lower()
-                    self.assertIn("no extractable text", detail)
-                    self.assertIn("ocr", detail)
+                    if find_tesseract_executable() is None:
+                        self.assertEqual(response.status_code, 400, response.text)
+                        self.assertIn("install tesseract", response.json()["detail"].lower())
+                    elif response.status_code == 200:
+                        payload = response.json()
+                        self.assertTrue(
+                            any(row.get("ocr_confidence") is not None for row in payload["tag_audit"])
+                        )
+                    else:
+                        detail = response.json()["detail"].lower()
+                        self.assertIn("ocr", detail)
                     continue
                 self.assertEqual(response.status_code, 200, response.text)
                 payload = response.json()
@@ -1135,6 +1491,8 @@ class SourceTopologyTests(unittest.TestCase):
 
     def test_right_side_legend_and_aligned_nozzles_restore_fixture_topology(self) -> None:
         pdf_path, _ = _supplied_fixture_files("08_multistage_recycle")
+        if not pdf_path.is_file():
+            self.skipTest("Supplied mid-complex fixture pack is not present")
         pdf_result = process_pdf(pdf_path.read_bytes(), filename=pdf_path.name)
         detected_equipment = {item["tag"]: item for item in pdf_result["equipment"]}
         expected_visible = {
@@ -1369,6 +1727,47 @@ class SourceTopologyTests(unittest.TestCase):
         self.assertEqual(set(result["edges"][0]["source_segment_ids"]), {"suction", "discharge"})
         self.assertEqual(result["edges"][0]["evidence_status"], "source_geometry")
         self.assertNotIn("confidence", result["edges"][0])
+
+    def test_diagonal_endpoint_gap_to_equipment_is_provisional(self) -> None:
+        equipment = [
+            {
+                "tag": "P-1",
+                "type": "pump",
+                "source_page": 0,
+                "source_bbox": [8, 48, 12, 52],
+                "source_symbol_bbox": [5, 45, 15, 55],
+            },
+            {
+                "tag": "E-1",
+                "type": "exchanger",
+                "source_page": 0,
+                "source_bbox": [48, 48, 52, 52],
+                "source_symbol_bbox": [45, 45, 55, 55],
+            },
+        ]
+        evidence = {
+            "classified_process_lines": 1,
+            "page_bounds": {"0": [0, 0, 1000, 1000]},
+            "segments": [
+                {
+                    "id": "diagonal",
+                    "page": 0,
+                    "kind": "process",
+                    "start": [15, 50],
+                    "end": [40, 47.5],
+                },
+            ],
+        }
+
+        result = build_process_graph(equipment, [], evidence)
+
+        self.assertTrue(nx.has_path(result["nx_graph"], "P-1", "E-1"))
+        self.assertTrue(
+            any(
+                edge["evidence_status"] == "provisional_nozzle_alignment"
+                for edge in result["edges"]
+            )
+        )
 
     def test_endpoint_gap_beyond_page_tolerance_does_not_create_a_connection(self) -> None:
         equipment = [

@@ -10,6 +10,9 @@ from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
+import os
+import re
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -26,6 +29,7 @@ from auth import current_user, issue_token
 from graph_engine import build_process_graph
 from pdf_processor import (
     PdfProcessError,
+    find_tesseract_executable,
     has_valid_source_bbox,
     match_excel_inventory,
     process_pdf,
@@ -41,6 +45,10 @@ from schemas import (
     KpiSummary,
     ProcessEdge,
     ProcessPidResponse,
+    ResolveAmbiguitiesRequest,
+    RegisterRequest,
+    RasterIntersectionCandidate,
+    RasterLineCandidate,
     RunListResponse,
     ResolveAmbiguityRequest,
     ResolveAmbiguityResponse,
@@ -54,8 +62,12 @@ logging.basicConfig(
 logger = logging.getLogger("untangle.main")
 
 API_VERSION = "v1.0"
-MODEL_STATUS = "PyMuPDF text/vector pipeline; OCR unavailable"
+MODEL_STATUS = (
+    "PyMuPDF text/vector pipeline; local Tesseract OCR "
+    + ("available" if find_tesseract_executable() else "not installed")
+)
 BACKEND_ENV_FILE = Path(__file__).with_name(".env")
+load_dotenv(dotenv_path=BACKEND_ENV_FILE, override=False)
 
 
 def load_backend_environment(dotenv_path: Path | None = None) -> None:
@@ -81,15 +93,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Explicit localhost origins for the frontend development servers.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+# Allow exact deployed frontend origins while retaining local development defaults.
+configured_origins = os.environ.get("UNTANGLE_CORS_ORIGINS", "")
+allowed_origins = [
+    origin.strip()
+    for origin in configured_origins.split(",")
+    if origin.strip()
+]
+if not allowed_origins:
+    allowed_origins = [
         "http://localhost:5173",
         "http://localhost:8080",
         "http://127.0.0.1:8080",
         "http://localhost:3000",
-    ],
+    ]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -113,13 +133,7 @@ def _source_tag_detections(pdf_result: dict) -> list[dict]:
     for equipment in pdf_result.get("equipment", []):
         tag = str(equipment.get("tag", "")).strip()
         bbox = equipment.get("source_bbox")
-        if not tag or tag.upper() in seen or not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
-            continue
-        try:
-            valid_bbox = float(bbox[2]) > float(bbox[0]) and float(bbox[3]) > float(bbox[1])
-        except (TypeError, ValueError):
-            valid_bbox = False
-        if not valid_bbox:
+        if not tag or tag.upper() in seen or not has_valid_source_bbox(bbox):
             continue
         detections.append(
             {
@@ -128,6 +142,10 @@ def _source_tag_detections(pdf_result: dict) -> list[dict]:
                 "source_bbox": list(bbox),
                 "source_page": equipment.get("source_page", equipment.get("page")),
                 "confidence": equipment.get("confidence", 0.0),
+                "raw_text": equipment.get("raw_text"),
+                "ocr_confidence": equipment.get("ocr_confidence"),
+                "ambiguous": equipment.get("ambiguous", False),
+                "ambiguity_reason": equipment.get("ambiguity_reason"),
             }
         )
         seen.add(tag.upper())
@@ -141,6 +159,39 @@ async def login(payload: LoginRequest) -> LoginResponse:
         payload.password, user["password_salt"], user["password_hash"]
     ):
         raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token, expires_at = issue_token(user)
+    return LoginResponse(
+        access_token=token,
+        expires_at=expires_at,
+        user={key: user[key] for key in ("user_id", "email", "full_name", "role")},
+    )
+
+
+@app.post("/api/auth/register", response_model=LoginResponse, status_code=201)
+async def register(payload: RegisterRequest) -> LoginResponse:
+    email = payload.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    full_name = payload.full_name.strip()
+    if not full_name:
+        raise HTTPException(status_code=422, detail="Full name cannot be blank.")
+    if sum(not character.isspace() for character in payload.password) < 12:
+        raise HTTPException(
+            status_code=422,
+            detail="Password must contain at least 12 non-whitespace characters.",
+        )
+    try:
+        user = run_storage.create_user(
+            email,
+            payload.password,
+            full_name=full_name,
+            role="Process Engineer",
+        )
+    except sqlite3.IntegrityError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="An account with this email address already exists.",
+        ) from exc
     token, expires_at = issue_token(user)
     return LoginResponse(
         access_token=token,
@@ -305,6 +356,13 @@ async def process_pid(
         pending_review_tags=pending_review,
         audit_rows=len(audit_rows),
         clarification_items=len(pdf_result.get("clarifications", [])),
+        deferred_clarification_items=int(
+            pdf_result.get("deferred_clarification_count", 0)
+        ),
+        raster_line_candidates=len(pdf_result.get("raster_line_candidates", [])),
+        raster_intersection_candidates=len(
+            pdf_result.get("raster_intersection_candidates", [])
+        ),
     )
 
     nodes = [EquipmentNode(**n) for n in graph_result["nodes"]]
@@ -321,6 +379,8 @@ async def process_pid(
             excel_sheets=row.get("excel_sheets", []),
             status=row["status"],
             confidence=float(row["confidence"]),
+            raw_text=row.get("raw_text"),
+            ocr_confidence=row.get("ocr_confidence"),
             reason=row.get("reason"),
         )
         for row in audit_rows
@@ -348,6 +408,14 @@ async def process_pid(
         edges=edges,
         tag_audit=tag_audit,
         clarification_queue=clarifications,
+        raster_line_candidates=[
+            RasterLineCandidate(**item)
+            for item in pdf_result.get("raster_line_candidates", [])
+        ],
+        raster_intersection_candidates=[
+            RasterIntersectionCandidate(**item)
+            for item in pdf_result.get("raster_intersection_candidates", [])
+        ],
         pdf_page_count=int(pdf_result["pdf_page_count"]),
         pdf_filename=pdf_name,
         excel_filename=excel_name,
@@ -615,6 +683,167 @@ async def resolve_ambiguity(payload: ResolveAmbiguityRequest, user: dict = Depen
         message=message,
         topology_changed=topology_changed,
     )
+
+
+@app.post("/api/resolve-ambiguities", response_model=ProcessPidResponse)
+async def resolve_ambiguities(
+    payload: ResolveAmbiguitiesRequest,
+    user: dict = Depends(current_user),
+) -> ProcessPidResponse:
+    """Apply several explicitly selected clarification answers in one graph pass."""
+    saved_run = run_storage.get_run(payload.run_id, user["user_id"])
+    if saved_run is None:
+        raise HTTPException(status_code=404, detail=f"Run '{payload.run_id}' was not found.")
+
+    answer_by_id = {answer.item_id.strip(): answer.selected_option.strip() for answer in payload.answers}
+    if "" in answer_by_id:
+        raise HTTPException(status_code=400, detail="Clarification IDs and choices cannot be blank.")
+    if len(answer_by_id) != len(payload.answers):
+        raise HTTPException(status_code=422, detail="A clarification can appear only once in a batch.")
+
+    queue_by_id = {item["id"]: item for item in saved_run["clarification_queue"]}
+    crossing_ids: dict[str, str] = {}
+    nozzle_ids: dict[str, str] = {}
+    statuses: dict[str, str] = {}
+    for item_id, option in answer_by_id.items():
+        item = queue_by_id.get(item_id)
+        if item is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Clarification '{item_id}' is not available for run '{payload.run_id}'.",
+            )
+        if option not in item["options"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid choice for clarification '{item_id}'. Choose one of: {', '.join(item['options'])}",
+            )
+        if item_id.startswith("crossing_p"):
+            crossing_ids[item_id] = option
+        elif item_id.startswith("nozzle_"):
+            nozzle_ids[item_id] = option
+        elif option != "Unresolved / Keep Flagged":
+            raise HTTPException(
+                status_code=422,
+                detail=f"Clarification '{item_id}' has no supported graph-resolution contract.",
+            )
+        statuses[item_id] = (
+            "unresolved"
+            if option == "Unresolved / Keep Flagged"
+            else "resolved"
+        )
+
+    graph_answers = {
+        item_id: option
+        for item_id, option in answer_by_id.items()
+        if statuses[item_id] == "resolved"
+    }
+    result_nodes = list(saved_run["nodes"])
+    result_edges = list(saved_run["edges"])
+    result_kpis = dict(saved_run["kpis"])
+    if graph_answers:
+        files = run_storage.get_run_files(payload.run_id, user["user_id"])
+        if files is None:
+            raise HTTPException(status_code=404, detail="The source files for this run were not found.")
+        try:
+            source_result = process_pdf(files["pdf_bytes"], filename=files["pdf_filename"])
+        except PdfProcessError as exc:
+            raise HTTPException(status_code=422, detail="The saved PDF could not be reprocessed.") from exc
+        current_source_question_ids = {
+            item["id"] for item in source_result["clarifications"]
+        }
+        if not set(graph_answers).issubset(current_source_question_ids):
+            raise HTTPException(
+                status_code=422,
+                detail="A selected clarification is not supported by the saved PDF evidence.",
+            )
+        existing_crossings = {
+            decision["item_id"]: decision["selected_option"]
+            for decision in saved_run.get("clarification_decisions", [])
+            if decision.get("status") == "resolved"
+            and decision.get("item_id", "").startswith("crossing_p")
+        }
+        existing_nozzles = {
+            decision["item_id"]: decision["selected_option"]
+            for decision in saved_run.get("clarification_decisions", [])
+            if decision.get("status") == "resolved"
+            and decision.get("item_id", "").startswith("nozzle_")
+        }
+        existing_crossings.update(crossing_ids)
+        existing_nozzles.update(nozzle_ids)
+        try:
+            workbook_result = load_excel_tags(
+                files["excel_bytes"], filename=files["excel_filename"]
+            )
+        except ExcelParseError as exc:
+            raise HTTPException(status_code=422, detail="The saved inventory could not be reprocessed.") from exc
+        audit = match_excel_inventory(
+            _source_tag_detections(source_result), workbook_result["tags"]
+        )
+        graph_result = build_process_graph(
+            source_result["equipment"],
+            audit,
+            source_result.get("drawing_evidence"),
+            crossing_resolutions=existing_crossings,
+            nozzle_resolutions=existing_nozzles,
+        )
+        result_nodes = graph_result["nodes"]
+        result_edges = graph_result["edges"]
+        result_kpis["graph_integrity"] = graph_result["graph_integrity"]
+        result_kpis["retained_equipment"] = graph_result["retained_equipment"]
+
+    updated_queue = []
+    for item in saved_run["clarification_queue"]:
+        if item["id"] not in answer_by_id:
+            updated_queue.append(item)
+        elif statuses[item["id"]] == "unresolved":
+            updated_queue.append(
+                {
+                    **item,
+                    "status": "unresolved",
+                    "selected_option": answer_by_id[item["id"]],
+                }
+            )
+    result_kpis["clarification_items"] = len(updated_queue)
+    decisions = [
+        *saved_run.get("clarification_decisions", []),
+        *[
+            {
+                "item_id": item_id,
+                "selected_option": option,
+                "status": statuses[item_id],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            for item_id, option in answer_by_id.items()
+        ],
+    ]
+    updated = {
+        **saved_run,
+        "kpis": result_kpis,
+        "nodes": result_nodes,
+        "edges": result_edges,
+        "clarification_queue": updated_queue,
+        "clarification_decisions": decisions,
+    }
+    try:
+        run_storage.record_decisions(
+            payload.run_id,
+            [
+                (item_id, option, statuses[item_id])
+                for item_id, option in answer_by_id.items()
+            ],
+            updated,
+            user["user_id"],
+        )
+    except run_storage.RunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Run '{payload.run_id}' was not found.") from exc
+    except run_storage.ClarificationAlreadyResolvedError as exc:
+        raise HTTPException(status_code=409, detail=f"Clarification '{exc}' was already resolved.") from exc
+    except run_storage.ClarificationNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Clarification '{exc}' was not found.") from exc
+    except Exception as exc:
+        logger.exception("Failed to persist clarification batch for run %s", payload.run_id)
+        raise HTTPException(status_code=500, detail="Clarification answers could not be saved.") from exc
+    return ProcessPidResponse.model_validate(updated)
 
 
 @app.get("/")

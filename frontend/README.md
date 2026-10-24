@@ -1,5 +1,30 @@
 # Diagram Digestive
 
+The API client defaults to `http://localhost:8000`. To use a deployed backend,
+copy `.env.example` to `.env` and set `VITE_UNTANGLE_API_BASE_URL` to its base
+URL, then restart the frontend development server.
+
+## Local development
+
+From this directory, install dependencies and start the frontend:
+
+```powershell
+bun install
+bun run dev
+```
+
+Run the backend separately from `untangled_backend`:
+
+```powershell
+cd ..\untangled_backend
+Copy-Item .env.example .env
+python -m pip install -r requirements.txt
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Set the backend `UNTANGLE_CORS_ORIGINS` environment variable to the exact
+frontend origin when using a non-local frontend host.
+
 Act as a Principal UI/UX Designer and Senior Frontend Engineer specializing in industrial engineering software and CAD digitisation tools. 
 
 Create a modern, high-impact, dark-themed interactive dashboard for "Project UNTANGLE" — an AI-Powered P&ID Digitisation & Process Simplification System.
